@@ -139,10 +139,16 @@ class ChatCompletions:
         system_prompt, user_message = _build_gemini_prompt(request.messages)
         gemini_tools = _convert_tools(request.tools) if request.tools else []
 
-        if request.stream:
-            return self._stream(user_message, system_prompt, request.model)
+        gen_kwargs = dict(
+            temperature=request.temperature if request.temperature != 1.0 else None,
+            max_output_tokens=request.max_tokens,
+            top_p=request.top_p if request.top_p != 1.0 else None,
+        )
 
-        return await self._complete(user_message, system_prompt, request.model, gemini_tools)
+        if request.stream:
+            return self._stream(user_message, system_prompt, request.model, **gen_kwargs)
+
+        return await self._complete(user_message, system_prompt, request.model, gemini_tools, **gen_kwargs)
 
     async def _complete(
         self,
@@ -150,6 +156,9 @@ class ChatCompletions:
         system_prompt: str,
         model: str,
         tools: Optional[list] = None,
+        temperature: Optional[float] = None,
+        max_output_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
     ) -> ChatCompletionResponse:
         result = None
         async for attempt in AsyncRetrying(**_RETRY_CONFIG):
@@ -160,12 +169,18 @@ class ChatCompletions:
                         api_key=self._api_key,
                         system_prompt=system_prompt,
                         tools=tools,
+                        temperature=temperature,
+                        max_output_tokens=max_output_tokens,
+                        top_p=top_p,
                     )
                 else:
                     text = await chat_once(
                         message=user_message,
                         api_key=self._api_key,
                         system_prompt=system_prompt,
+                        temperature=temperature,
+                        max_output_tokens=max_output_tokens,
+                        top_p=top_p,
                     )
                     function_calls = []
                 result = (text, function_calls)
@@ -225,7 +240,13 @@ class ChatCompletions:
         )
 
     async def _stream(
-        self, user_message: str, system_prompt: str, model: str
+        self,
+        user_message: str,
+        system_prompt: str,
+        model: str,
+        temperature: Optional[float] = None,
+        max_output_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
     ) -> AsyncIterator[dict]:
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
@@ -247,6 +268,9 @@ class ChatCompletions:
                     message=user_message,
                     api_key=self._api_key,
                     system_prompt=system_prompt,
+                    temperature=temperature,
+                    max_output_tokens=max_output_tokens,
+                    top_p=top_p,
                 ):
                     yield {
                         "id": completion_id,

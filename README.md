@@ -212,7 +212,10 @@ Once running, visit `http://localhost:8000/docs` for interactive API docs powere
 | `stream` | bool | Enable SSE streaming (default: `false`) |
 | `tools` | array | OpenAI function definitions (converted to Gemini `FunctionDeclaration`) |
 | `tool_choice` | string/object | Accepted but not forwarded to Gemini |
-| `temperature`, `max_tokens`, `top_p`, `stop` | — | Accepted but not forwarded to Gemini Live API |
+| `temperature` | float | Forwarded to Gemini `GenerationConfig` (default: model default) |
+| `max_tokens` | int | Forwarded as `max_output_tokens` |
+| `top_p` | float | Forwarded to Gemini `GenerationConfig` (default: model default) |
+| `stop` | string/array | Accepted but ignored — not supported by Gemini Live API |
 
 ### Error Codes
 

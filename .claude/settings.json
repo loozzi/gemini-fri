@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:ai.google.dev)",
+      "WebFetch(domain:google-genai.readthedocs.io)",
+      "WebFetch(domain:googleapis.dev)"
+    ]
+  }
+}

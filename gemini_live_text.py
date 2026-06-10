@@ -34,22 +34,27 @@ DEFAULT_SYSTEM_PROMPT = "Bạn là trợ lý AI hữu ích, trả lời ngắn g
 # ─── Core: one-shot chat ──────────────────────────────────────────────────────
 
 
+def _make_generation_config(
+    temperature: Optional[float] = None,
+    max_output_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
+) -> Optional[types.GenerationConfig]:
+    kwargs = {k: v for k, v in {
+        "temperature": temperature,
+        "max_output_tokens": max_output_tokens,
+        "top_p": top_p,
+    }.items() if v is not None}
+    return types.GenerationConfig(**kwargs) if kwargs else None
+
+
 async def chat_once(
     message: str,
     api_key: str = DEFAULT_API_KEY,
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+    temperature: Optional[float] = None,
+    max_output_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
 ) -> str:
-    """
-    Gửi một tin nhắn và nhận phản hồi dạng text.
-
-    Args:
-        message:       Nội dung tin nhắn
-        api_key:       Gemini API key
-        system_prompt: System instruction cho model
-
-    Returns:
-        Chuỗi text phản hồi từ model
-    """
     client = genai.Client(
         api_key=api_key,
         http_options=types.HttpOptions(api_version="v1alpha"),
@@ -61,6 +66,7 @@ async def chat_once(
         system_instruction=types.Content(
             parts=[types.Part(text=system_prompt)]
         ),
+        generation_config=_make_generation_config(temperature, max_output_tokens, top_p),
     )
 
     response_parts: list[str] = []
@@ -86,6 +92,9 @@ async def chat_stream(
     message: str,
     api_key: str = DEFAULT_API_KEY,
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+    temperature: Optional[float] = None,
+    max_output_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
 ) -> AsyncGenerator[str, None]:
     """Yield text chunks từ Gemini Live API (dùng cho streaming response)."""
     client = genai.Client(
@@ -99,6 +108,7 @@ async def chat_stream(
         system_instruction=types.Content(
             parts=[types.Part(text=system_prompt)]
         ),
+        generation_config=_make_generation_config(temperature, max_output_tokens, top_p),
     )
 
     async with client.aio.live.connect(model=MODEL, config=config) as session:
@@ -121,6 +131,9 @@ async def chat_once_ex(
     api_key: str = DEFAULT_API_KEY,
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
     tools: Optional[list] = None,
+    temperature: Optional[float] = None,
+    max_output_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
 ) -> tuple[str, list[dict]]:
     """
     Extended chat_once with function calling support.
@@ -139,6 +152,7 @@ async def chat_once_ex(
             parts=[types.Part(text=system_prompt)]
         ),
         tools=tools or [],
+        generation_config=_make_generation_config(temperature, max_output_tokens, top_p),
     )
 
     text_parts: list[str] = []
