@@ -215,7 +215,6 @@ Once running, visit `http://localhost:8000/docs` for interactive API docs powere
 | `temperature` | float | Forwarded to Gemini `GenerationConfig` (default: model default) |
 | `max_tokens` | int | Forwarded as `max_output_tokens` |
 | `top_p` | float | Forwarded to Gemini `GenerationConfig` (default: model default) |
-| `stop` | string/array | Accepted but ignored — not supported by Gemini Live API |
 
 ### Error Codes
 
