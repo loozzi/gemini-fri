@@ -2,11 +2,23 @@ from typing import List, Literal, Optional, Union
 from pydantic import BaseModel
 
 
+class ToolCallFunction(BaseModel):
+    name: str
+    arguments: str  # JSON-encoded string
+
+
+class ToolCall(BaseModel):
+    id: str
+    type: str = "function"
+    function: ToolCallFunction
+
+
 class Message(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
-    content: Union[str, List[dict]]
+    content: Optional[Union[str, List[dict]]] = None  # None when tool_calls present
     name: Optional[str] = None
     tool_call_id: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -25,6 +37,13 @@ class ChatCompletionRequest(BaseModel):
 class ChoiceDelta(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
+
+
+class ChoiceDeltaToolCall(BaseModel):
+    index: int
+    id: Optional[str] = None
+    type: Optional[str] = "function"
+    function: Optional[ToolCallFunction] = None
 
 
 class Choice(BaseModel):

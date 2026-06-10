@@ -15,7 +15,8 @@ Sử dụng:
 import argparse
 import asyncio
 import os
-from typing import AsyncGenerator
+import uuid as _uuid
+from typing import AsyncGenerator, Optional
 
 from dotenv import load_dotenv
 from google import genai
@@ -113,6 +114,57 @@ async def chat_stream(
 
             if server_content.turn_complete:
                 break
+
+
+async def chat_once_ex(
+    message: str,
+    api_key: str = DEFAULT_API_KEY,
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+    tools: Optional[list] = None,
+) -> tuple[str, list[dict]]:
+    """
+    Extended chat_once with function calling support.
+    Returns (text, function_calls) where function_calls is a list of
+    {"id": str, "name": str, "args": dict}.
+    """
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(api_version="v1alpha"),
+    )
+
+    config = types.LiveConnectConfig(
+        response_modalities=["AUDIO"],
+        output_audio_transcription=types.AudioTranscriptionConfig(),
+        system_instruction=types.Content(
+            parts=[types.Part(text=system_prompt)]
+        ),
+        tools=tools or [],
+    )
+
+    text_parts: list[str] = []
+    function_calls: list[dict] = []
+
+    async with client.aio.live.connect(model=MODEL, config=config) as session:
+        await session.send_realtime_input(text=message)
+
+        async for response in session.receive():
+            server_content = response.server_content
+            if server_content:
+                if server_content.output_transcription:
+                    text_parts.append(server_content.output_transcription.text)
+                if server_content.turn_complete:
+                    break
+
+            if response.tool_call:
+                for fc in response.tool_call.function_calls:
+                    function_calls.append({
+                        "id": getattr(fc, "id", None) or f"call_{_uuid.uuid4().hex[:8]}",
+                        "name": fc.name,
+                        "args": dict(fc.args) if fc.args else {},
+                    })
+                break
+
+    return "".join(text_parts), function_calls
 
 
 # ─── Core: interactive session ────────────────────────────────────────────────

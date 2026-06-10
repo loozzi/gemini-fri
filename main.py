@@ -1,8 +1,10 @@
 import json
+import logging
 import os
+import time
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from sdk.core.exceptions import APIError, AuthError, RateLimitError, ServerError
@@ -10,6 +12,13 @@ from sdk.core.models import ChatCompletionRequest
 from sdk.resources.chat import ChatCompletions
 
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+logger = logging.getLogger("api")
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 SERVER_API_KEY = os.environ.get("SERVER_API_KEY", "")  # optional: protect this server
@@ -31,6 +40,21 @@ def _resolve_api_key(authorization: str | None) -> str:
     elif SERVER_API_KEY:
         raise AuthError(401, "Authorization header required")
     return GEMINI_API_KEY
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.perf_counter()
+    logger.info("→ %s %s", request.method, request.url.path)
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.error("← ERROR %.1fms — %s: %s", elapsed_ms, type(exc).__name__, exc)
+        raise
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    logger.info("← %d %.1fms", response.status_code, elapsed_ms)
+    return response
 
 
 @app.exception_handler(AuthError)
