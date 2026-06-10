@@ -1,9 +1,7 @@
 import json
 import logging
-import os
 import time
 
-from dotenv import load_dotenv
 from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -11,17 +9,12 @@ from sdk.core.exceptions import APIError, AuthError, RateLimitError, ServerError
 from sdk.core.models import ChatCompletionRequest
 from sdk.resources.chat import ChatCompletions
 
-load_dotenv()
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 logger = logging.getLogger("api")
-
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-SERVER_API_KEY = os.environ.get("SERVER_API_KEY", "")  # optional: protect this server
 
 app = FastAPI(
     title="OpenAI-Compatible Gemini API",
@@ -31,15 +24,13 @@ app = FastAPI(
 
 
 def _resolve_api_key(authorization: str | None) -> str:
-    """Return the Gemini API key to use for this request."""
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization.removeprefix("Bearer ").strip()
-        # if a server key is configured, token must match it; we still use GEMINI_API_KEY
-        if SERVER_API_KEY and token != SERVER_API_KEY:
-            raise AuthError(401, "Invalid API key")
-    elif SERVER_API_KEY:
-        raise AuthError(401, "Authorization header required")
-    return GEMINI_API_KEY
+    """Extract the Gemini API key from the Authorization header."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise AuthError(401, "Authorization header required: Bearer <your-gemini-api-key>")
+    key = authorization.removeprefix("Bearer ").strip()
+    if not key:
+        raise AuthError(401, "API key must not be empty")
+    return key
 
 
 @app.middleware("http")
@@ -95,10 +86,6 @@ async def create_chat_completion(
     authorization: str | None = Header(default=None),
 ):
     api_key = _resolve_api_key(authorization)
-
-    if not api_key:
-        raise AuthError(401, "GEMINI_API_KEY not configured on server")
-
     completions = ChatCompletions(api_key=api_key)
 
     if request.stream:
