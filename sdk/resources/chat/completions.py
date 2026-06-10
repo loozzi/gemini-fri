@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import time
@@ -12,7 +13,7 @@ from tenacity import (
     before_sleep_log,
 )
 
-from sdk.core.exceptions import AuthError
+from sdk.core.exceptions import AuthError, RateLimitError
 from sdk.core.models import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -33,13 +34,84 @@ from gemini_live_text import (
 
 logger = logging.getLogger(__name__)
 
+
+# ─── Token Bucket ─────────────────────────────────────────────────────────────
+
+
+class TokenBucket:
+    """Client-side rate limiter: proactively throttle to stay under TPM limit."""
+
+    def __init__(self, tpm: int = 65_000):
+        self._capacity = tpm
+        self._tokens = float(tpm)
+        self._last_refill = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def consume(self, tokens: int) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_refill
+            self._tokens = min(
+                self._capacity,
+                self._tokens + elapsed / 60.0 * self._capacity,
+            )
+            self._last_refill = now
+
+            if tokens > self._tokens:
+                wait_sec = (tokens - self._tokens) / self._capacity * 60.0
+                logger.debug(
+                    "Token bucket throttling %.1fs (need %d, have %.0f)",
+                    wait_sec, tokens, self._tokens,
+                )
+                await asyncio.sleep(wait_sec)
+                self._tokens = 0.0
+            else:
+                self._tokens -= tokens
+
+
+def _estimate_tokens(text: str) -> int:
+    return max(1, len(text) // 4)
+
+
+# ─── Retry ────────────────────────────────────────────────────────────────────
+
+
+_wait_default = wait_exponential(multiplier=1, min=2, max=30)
+_wait_rate_limit = wait_exponential(multiplier=2, min=30, max=120)
+
+
+def _smart_wait(retry_state):
+    if isinstance(retry_state.outcome.exception(), RateLimitError):
+        return _wait_rate_limit(retry_state)
+    return _wait_default(retry_state)
+
+
 _RETRY_CONFIG = dict(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=30),
+    stop=stop_after_attempt(5),
+    wait=_smart_wait,
     retry=retry_if_not_exception_type(AuthError),
     before_sleep=before_sleep_log(logger, logging.WARNING),
     reraise=True,
 )
+
+
+# ─── Exception translation ────────────────────────────────────────────────────
+
+
+def _translate_exc(exc: Exception) -> Exception:
+    """Convert google-genai SDK exceptions to our SDK exceptions."""
+    try:
+        from google.genai import errors as _gerrors
+        if isinstance(exc, (_gerrors.ClientError, _gerrors.APIError)):
+            code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+            msg = str(exc)
+            if code == 429 or "429" in msg:
+                return RateLimitError(429, msg)
+            if code == 401 or "401" in msg:
+                return AuthError(401, msg)
+    except (ImportError, AttributeError):
+        pass
+    return exc
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -129,8 +201,9 @@ def _convert_tools(openai_tools: List[dict]) -> list:
 
 
 class ChatCompletions:
-    def __init__(self, api_key: str = DEFAULT_API_KEY):
+    def __init__(self, api_key: str = DEFAULT_API_KEY, tpm: int = 65_000):
         self._api_key = api_key
+        self._bucket = TokenBucket(tpm)
 
     async def create(
         self,
@@ -160,29 +233,37 @@ class ChatCompletions:
         max_output_tokens: Optional[int] = None,
         top_p: Optional[float] = None,
     ) -> ChatCompletionResponse:
+        await self._bucket.consume(_estimate_tokens(user_message))
+
         result = None
         async for attempt in AsyncRetrying(**_RETRY_CONFIG):
             with attempt:
-                if tools:
-                    text, function_calls = await chat_once_ex(
-                        message=user_message,
-                        api_key=self._api_key,
-                        system_prompt=system_prompt,
-                        tools=tools,
-                        temperature=temperature,
-                        max_output_tokens=max_output_tokens,
-                        top_p=top_p,
-                    )
-                else:
-                    text = await chat_once(
-                        message=user_message,
-                        api_key=self._api_key,
-                        system_prompt=system_prompt,
-                        temperature=temperature,
-                        max_output_tokens=max_output_tokens,
-                        top_p=top_p,
-                    )
-                    function_calls = []
+                try:
+                    if tools:
+                        text, function_calls = await chat_once_ex(
+                            message=user_message,
+                            api_key=self._api_key,
+                            system_prompt=system_prompt,
+                            tools=tools,
+                            temperature=temperature,
+                            max_output_tokens=max_output_tokens,
+                            top_p=top_p,
+                        )
+                    else:
+                        text = await chat_once(
+                            message=user_message,
+                            api_key=self._api_key,
+                            system_prompt=system_prompt,
+                            temperature=temperature,
+                            max_output_tokens=max_output_tokens,
+                            top_p=top_p,
+                        )
+                        function_calls = []
+                except Exception as exc:
+                    translated = _translate_exc(exc)
+                    if translated is not exc:
+                        raise translated from exc
+                    raise
                 result = (text, function_calls)
 
         text, function_calls = result
@@ -248,6 +329,8 @@ class ChatCompletions:
         max_output_tokens: Optional[int] = None,
         top_p: Optional[float] = None,
     ) -> AsyncIterator[dict]:
+        await self._bucket.consume(_estimate_tokens(user_message))
+
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
 
@@ -259,10 +342,8 @@ class ChatCompletions:
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
         }
 
-        # Retry only the connection/generator setup; individual chunks are not retried
         attempt_count = 0
-        last_exc: BaseException | None = None
-        while attempt_count < 3:
+        while attempt_count < 5:
             try:
                 async for text_chunk in chat_stream(
                     message=user_message,
@@ -279,17 +360,19 @@ class ChatCompletions:
                         "model": model,
                         "choices": [{"index": 0, "delta": {"content": text_chunk}, "finish_reason": None}],
                     }
-                break  # success
+                break
             except AuthError:
                 raise
             except Exception as exc:
+                exc = _translate_exc(exc)
                 attempt_count += 1
-                last_exc = exc
                 logger.warning("Stream attempt %d failed: %s", attempt_count, exc)
-                if attempt_count >= 3:
-                    raise
-                wait_sec = min(2 ** attempt_count, 30)
-                import asyncio
+                if attempt_count >= 5:
+                    raise exc
+                if isinstance(exc, RateLimitError):
+                    wait_sec = min(30 * (2 ** (attempt_count - 1)), 120)
+                else:
+                    wait_sec = min(2 ** attempt_count, 30)
                 await asyncio.sleep(wait_sec)
 
         yield {
