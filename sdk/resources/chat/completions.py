@@ -161,6 +161,23 @@ def _convert_tools(openai_tools: List[dict]) -> list:
         "object": "OBJECT",
     }
 
+    def convert_schema(schema: dict) -> gtypes.Schema:
+        raw_type = schema.get("type", "string").lower()
+        prop_type = type_map.get(raw_type, "STRING")
+        kwargs: dict = {"type": prop_type}
+        if desc := schema.get("description"):
+            kwargs["description"] = desc
+        if prop_type == "ARRAY":
+            items_schema = schema.get("items", {})
+            kwargs["items"] = convert_schema(items_schema)
+        if prop_type == "OBJECT" and schema.get("properties"):
+            kwargs["properties"] = {
+                k: convert_schema(v) for k, v in schema["properties"].items()
+            }
+            if schema.get("required"):
+                kwargs["required"] = schema["required"]
+        return gtypes.Schema(**kwargs)
+
     function_declarations = []
     for tool in openai_tools:
         if tool.get("type") != "function":
@@ -170,11 +187,7 @@ def _convert_tools(openai_tools: List[dict]) -> list:
 
         properties: dict = {}
         for prop_name, prop_schema in params.get("properties", {}).items():
-            prop_type = type_map.get(prop_schema.get("type", "string").lower(), "STRING")
-            prop_kwargs: dict = {"type": prop_type}
-            if desc := prop_schema.get("description"):
-                prop_kwargs["description"] = desc
-            properties[prop_name] = gtypes.Schema(**prop_kwargs)
+            properties[prop_name] = convert_schema(prop_schema)
 
         gemini_params = None
         if properties:
