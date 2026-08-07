@@ -3,6 +3,7 @@ import logging
 import time
 
 from fastapi import FastAPI, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from sdk.core.exceptions import APIError, AuthError, RateLimitError, ServerError
@@ -20,6 +21,13 @@ app = FastAPI(
     title="OpenAI-Compatible Gemini API",
     description="FastAPI server wrapping Gemini Live API with OpenAI-compatible interface",
     version="0.1.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
