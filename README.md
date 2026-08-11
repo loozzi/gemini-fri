@@ -1,6 +1,6 @@
 # gemini-fri
 
-Transforms the **Google Gemini Live API** into an **OpenAI-compatible REST API** — drop it in wherever you use OpenAI, no code changes needed.
+Transforms the **Google Gemini Live API** into an **OpenAI-compatible** and **Ollama-compatible** REST API — drop it in wherever you use OpenAI or Ollama, no code changes needed.
 
 > [!NOTE]
 > This project is intended for **research and educational purposes only**. Please use responsibly and refrain from any commercial use.
@@ -17,6 +17,7 @@ Transforms the **Google Gemini Live API** into an **OpenAI-compatible REST API**
 **Solution:** A local FastAPI server that:
 
 - Exposes `POST /openai/v1/chat/completions` — identical to the OpenAI spec
+- Also speaks the **Ollama protocol** (`/api/chat`, `/api/tags`, …) for Open WebUI, `ChatOllama`, Continue
 - Works with the OpenAI Python/JS SDK, LangChain, and any OpenAI-compatible tool
 - Supports both **streaming** (SSE) and **non-streaming** responses
 - Converts multi-turn message history to Gemini Live API format automatically
@@ -75,6 +76,7 @@ curl -X POST http://localhost:8000/openai/v1/chat/completions \
 - **Streaming support** — real-time SSE chunks via Gemini Live API
 - **Image input (vision)** — OpenAI `image_url` content parts with base64 `data:` URLs, sent to Gemini as `inline_data`
 - **Structured output** — `response_format` with `json_schema` or `json_object`; works with `with_structured_output()` and `client.beta.chat.completions.parse()`
+- **Ollama-compatible surface** — `/api/chat` (NDJSON streaming), `/api/tags`, `/api/show`, `/api/version`; images, tools and `format` all supported
 - **Function/tool calling** — full OpenAI tool-call format; automatically converted to Gemini `FunctionDeclaration`
 - **Auto-retry** — up to 3 attempts with exponential backoff (2s → 30s); auth errors are not retried
 - **Optional auth** — protect your server with a bearer token (`SERVER_API_KEY`)
@@ -248,6 +250,54 @@ curl -X POST http://localhost:8000/openai/v1/chat/completions \
   }'
 ```
 
+### Ollama-compatible endpoints
+
+Point any Ollama client at this server instead of `http://localhost:11434`.
+
+```python
+from ollama import Client
+
+client = Client(host="http://localhost:8000")
+MODEL = "gemini-3.1-flash-live-preview:latest"   # as returned by /api/tags
+
+# streaming (Ollama's default)
+for chunk in client.chat(model=MODEL, messages=[{"role": "user", "content": "Xin chào!"}]):
+    print(chunk.message.content, end="", flush=True)
+
+# with an image — bare base64, no data: prefix
+import base64
+client.chat(model=MODEL, stream=False, messages=[{
+    "role": "user",
+    "content": "Ảnh này là gì?",
+    "images": [base64.b64encode(open("photo.jpg", "rb").read()).decode()],
+}])
+
+# structured output via `format`
+client.chat(model=MODEL, stream=False, format={
+    "type": "object",
+    "properties": {"city": {"type": "string"}},
+}, messages=[{"role": "user", "content": "Thủ đô Việt Nam."}])
+```
+
+```bash
+curl http://localhost:8000/api/chat -d '{
+  "model": "gemini-3.1-flash-live-preview:latest",
+  "messages": [{"role": "user", "content": "Hello!"}]
+}'
+```
+
+**Authentication.** Ollama has no auth, and most Ollama clients cannot set headers. So this surface takes the key from `Authorization: Bearer <key>` if present, otherwise from the `GEMINI_API_KEY` environment variable:
+
+```bash
+GEMINI_API_KEY=your_key uvicorn main:app
+```
+
+> This is the one place the server is not fully stateless. `/openai/v1` still requires the header and never falls back to the environment.
+
+**Mapping.** `options.temperature` / `top_p` / `num_predict` → generation config; `format` → structured output; `images` → Gemini `inline_data` (mime type detected from the bytes, since Ollama sends bare base64); `tools` and `tool_calls` are translated both ways, including Ollama's object-valued `arguments`. `keep_alive`, `think` and `raw` are accepted and ignored. Model-management endpoints (`/api/pull`, `/api/create`, …) are not implemented — there is no local model to manage.
+
+`/api/tags` reports `size: 0` and `digest: ""` because no model file exists here; those fields are left empty rather than filled with invented values.
+
 ### Built-in CLI (`gemini_live_text.py`)
 
 ```bash
@@ -272,6 +322,10 @@ Once running, visit `http://localhost:8000/docs` for interactive API docs powere
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/openai/v1/chat/completions` | OpenAI-compatible chat completions |
+| `POST` | `/api/chat` | Ollama-compatible chat (NDJSON streaming) |
+| `GET` | `/api/tags` | Ollama-compatible model list |
+| `POST` | `/api/show` | Ollama-compatible model info |
+| `GET` | `/api/version` | Ollama version (compatibility constant) |
 | `GET` | `/health` | Health check |
 | `GET` | `/docs` | Swagger UI |
 
@@ -305,31 +359,40 @@ Once running, visit `http://localhost:8000/docs` for interactive API docs powere
 ```
 gemini-fri/
 ├── gemini_live_text.py          # Standalone CLI demo (text only, independent of sdk/)
-├── main.py                      # FastAPI app & routes
+├── main.py                      # FastAPI app, OpenAI route, exception handlers
 ├── requirements.txt
 ├── pyproject.toml
+├── routers/
+│   └── ollama.py                # Ollama-compatible endpoints
 └── sdk/
     ├── __init__.py              # OpenAICompatClient
     ├── types.py                 # MessageRole, FinishReason enums
     ├── core/
-    │   ├── models.py            # Pydantic schemas (request / response / tool call)
-    │   ├── content.py           # OpenAI content → Gemini parts (text + images), validation
+    │   ├── models.py            # OpenAI pydantic schemas (request / response / tool call)
+    │   ├── ollama_models.py     # Ollama pydantic schemas
+    │   ├── content.py           # OpenAI content → Gemini parts (text + images), mime sniffing
     │   └── exceptions.py        # SDKError, APIError, InvalidRequestError, AuthError, RateLimitError, ServerError
     ├── providers/
     │   └── gemini_live.py       # Gemini Live API client (chat_once, chat_stream, chat_once_ex)
     └── resources/
-        └── chat/
-            └── completions.py   # ChatCompletions.create(), retry logic, tool conversion
+        ├── chat/
+        │   └── completions.py   # ChatCompletions.create(), retry, tools, response_format
+        └── ollama/
+            └── chat.py          # Ollama ⇄ OpenAI translation
 ```
 
 ### How it works
 
 ```
-Client (OpenAI SDK / curl)
-        │
-        ▼
-FastAPI  main.py
-        │  auth check, request routing
+Client (OpenAI SDK / curl)          Client (Ollama SDK / Open WebUI)
+        │                                    │
+        ▼                                    ▼
+FastAPI  main.py                     routers/ollama.py
+        │  auth check, routing               │  auth (header → env), NDJSON, Ollama errors
+        │                                    ▼
+        │                            sdk/resources/ollama/chat.py
+        │                                    │  rewrites into ChatCompletionRequest
+        ├────────────────────────────────────┘
         ▼
 sdk/core/content.py
         │  converts OpenAI messages → (system_prompt, list[Part])

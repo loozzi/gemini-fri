@@ -354,15 +354,16 @@ class ChatCompletions:
             top_p=request.top_p if request.top_p != 1.0 else None,
         )
 
-        if request.stream and structured is None:
+        # The streaming path cannot carry tools or a schema, so those requests
+        # run to completion first and are replayed as chunks. Streaming them
+        # directly would silently drop what the client asked for.
+        if request.stream and structured is None and not gemini_tools:
             return self._stream(parts, system_prompt, request.model, **gen_kwargs)
 
         response = await self._complete(
             parts, system_prompt, request.model, gemini_tools, structured, **gen_kwargs
         )
 
-        # Structured output needs the whole answer before it can be validated,
-        # so a streaming client gets it as one chunk rather than not at all.
         if request.stream:
             return self._replay(response)
 
@@ -487,6 +488,30 @@ class ChatCompletions:
                 **base,
                 "choices": [
                     {"index": 0, "delta": {"content": choice.message.content}, "finish_reason": None}
+                ],
+            }
+        if choice.message and choice.message.tool_calls:
+            yield {
+                **base,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": i,
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments,
+                                    },
+                                }
+                                for i, tc in enumerate(choice.message.tool_calls)
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
                 ],
             }
         yield {

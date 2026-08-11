@@ -6,6 +6,7 @@ from fastapi import FastAPI, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from routers import ollama
 from sdk.core.exceptions import APIError, AuthError, RateLimitError, ServerError
 from sdk.core.models import ChatCompletionRequest
 from sdk.resources.chat import ChatCompletions
@@ -29,6 +30,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(ollama.router)
 
 
 def _resolve_api_key(authorization: str | None) -> str:

@@ -69,6 +69,27 @@ def parse_data_url(url: str, where: str = "image") -> tuple[str, bytes]:
     return mime_type, data
 
 
+def sniff_image_mime(data: bytes) -> Optional[str]:
+    """Identify an image by magic bytes.
+
+    Ollama sends bare base64 with no mime type, so the format has to be read
+    off the bytes themselves.
+    """
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[4:8] == b"ftyp":
+        brand = data[8:12]
+        if brand in (b"heic", b"heix", b"hevc", b"hevx"):
+            return "image/heic"
+        if brand in (b"heif", b"mif1", b"msf1"):
+            return "image/heif"
+    return None
+
+
 class _ImageBudget:
     """Track total decoded image bytes across a request."""
 
