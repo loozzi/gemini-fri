@@ -74,6 +74,7 @@ curl -X POST http://localhost:8000/openai/v1/chat/completions \
 - **OpenAI-compatible** — works as a drop-in replacement for the OpenAI API
 - **Streaming support** — real-time SSE chunks via Gemini Live API
 - **Image input (vision)** — OpenAI `image_url` content parts with base64 `data:` URLs, sent to Gemini as `inline_data`
+- **Structured output** — `response_format` with `json_schema` or `json_object`; works with `with_structured_output()` and `client.beta.chat.completions.parse()`
 - **Function/tool calling** — full OpenAI tool-call format; automatically converted to Gemini `FunctionDeclaration`
 - **Auto-retry** — up to 3 attempts with exponential backoff (2s → 30s); auth errors are not retried
 - **Optional auth** — protect your server with a bearer token (`SERVER_API_KEY`)
@@ -187,6 +188,38 @@ tool_call = response.choices[0].message.tool_calls[0]
 print(tool_call.function.name, tool_call.function.arguments)
 ```
 
+### Structured Output
+
+`response_format` is supported with both `json_schema` and `json_object`. The response `content` is a JSON string matching your schema.
+
+```python
+from pydantic import BaseModel
+
+class EmailContent(BaseModel):
+    sender: str | None = None
+    recipients: list[str] = []
+    body: str
+
+# OpenAI SDK
+completion = await client.beta.chat.completions.parse(
+    model="gemini",
+    messages=[{"role": "user", "content": "Trích xuất thông tin từ email này..."}],
+    response_format=EmailContent,
+)
+print(completion.choices[0].message.parsed)
+```
+
+```python
+# LangChain — the default method="json_schema" works
+from langchain_openai import ChatOpenAI
+
+llm = ChatOpenAI(base_url="http://localhost:8000/openai/v1",
+                 api_key="YOUR_GEMINI_API_KEY", model="gemini")
+result = llm.with_structured_output(EmailContent).invoke([message])
+```
+
+> **How this works:** the Gemini Live API has no native structured output — it rejects `response_schema` with `1007: response_schema not supported in generation config`, and this model refuses `response_modalities=["TEXT"]`. So the server declares your schema as a function and instructs the model to answer by calling it, then returns the call arguments as `message.content`. If the model replies with prose instead, the server tries to parse that text as JSON before giving up. Reliable in practice, but not a hard guarantee the way OpenAI's strict mode is.
+
 ### cURL — non-streaming
 
 ```bash
@@ -251,6 +284,7 @@ Once running, visit `http://localhost:8000/docs` for interactive API docs powere
 | `stream` | bool | Enable SSE streaming (default: `false`) |
 | `tools` | array | OpenAI function definitions (converted to Gemini `FunctionDeclaration`) |
 | `tool_choice` | string/object | Accepted but not forwarded to Gemini |
+| `response_format` | object | `{"type": "json_schema", ...}`, `{"type": "json_object"}` or `{"type": "text"}`; implemented via function calling |
 | `temperature` | float | Forwarded to Gemini `GenerationConfig` (default: model default) |
 | `max_tokens` | int | Forwarded as `max_output_tokens` |
 | `top_p` | float | Forwarded to Gemini `GenerationConfig` (default: model default) |
@@ -259,7 +293,7 @@ Once running, visit `http://localhost:8000/docs` for interactive API docs powere
 
 | HTTP Status | Exception | Cause |
 |---|---|---|
-| `400` | `InvalidRequestError` | Malformed content part — bad data URL, unsupported image type, oversized payload, image outside a `user` message |
+| `400` | `InvalidRequestError` | Malformed content part (bad data URL, unsupported image type, oversized payload, image outside a `user` message) or malformed `response_format` |
 | `401` | `AuthError` | Missing or invalid API key |
 | `429` | `RateLimitError` | Gemini quota exceeded |
 | `5xx` | `ServerError` | Gemini upstream error |

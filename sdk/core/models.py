@@ -31,6 +31,7 @@ class ChatCompletionRequest(BaseModel):
     stop: Optional[Union[str, List[str]]] = None
     tools: Optional[List[dict]] = None
     tool_choice: Optional[Union[str, dict]] = None
+    response_format: Optional[dict] = None
     user: Optional[str] = None
 
 

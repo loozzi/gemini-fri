@@ -1,9 +1,10 @@
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
-from typing import AsyncIterator, List, Optional, Union
+from typing import AsyncIterator, List, NamedTuple, Optional, Union
 
 from tenacity import (
     AsyncRetrying,
@@ -16,7 +17,7 @@ from tenacity import (
 from google.genai import types as gtypes
 
 from sdk.core.content import build_parts, estimate_tokens, parts_text
-from sdk.core.exceptions import AuthError, RateLimitError
+from sdk.core.exceptions import AuthError, InvalidRequestError, RateLimitError
 from sdk.core.models import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -116,66 +117,212 @@ def _translate_exc(exc: Exception) -> Exception:
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 
-def _convert_tools(openai_tools: List[dict]) -> list:
-    """Convert OpenAI tools format → Gemini FunctionDeclaration list."""
-    from google.genai import types as gtypes
+_TYPE_MAP = {
+    "string": "STRING",
+    "integer": "INTEGER",
+    "number": "NUMBER",
+    "boolean": "BOOLEAN",
+    "array": "ARRAY",
+    "object": "OBJECT",
+}
 
-    type_map = {
-        "string": "STRING",
-        "integer": "INTEGER",
-        "number": "NUMBER",
-        "boolean": "BOOLEAN",
-        "array": "ARRAY",
-        "object": "OBJECT",
+
+def _resolve_refs(node, defs: dict, depth: int = 0):
+    """Inline $ref pointers so nested Pydantic models survive conversion."""
+    if depth > 16:  # recursive schema — stop rather than loop forever
+        return {"type": "string"}
+    if isinstance(node, list):
+        return [_resolve_refs(item, defs, depth + 1) for item in node]
+    if not isinstance(node, dict):
+        return node
+    if "$ref" in node:
+        target = defs.get(node["$ref"].rsplit("/", 1)[-1], {})
+        return _resolve_refs(target, defs, depth + 1)
+    return {
+        key: _resolve_refs(value, defs, depth + 1)
+        for key, value in node.items()
+        if key != "$defs"
     }
 
-    def convert_schema(schema: dict) -> gtypes.Schema:
-        raw_type = schema.get("type", "string").lower()
-        prop_type = type_map.get(raw_type, "STRING")
-        kwargs: dict = {"type": prop_type}
-        if desc := schema.get("description"):
-            kwargs["description"] = desc
-        if prop_type == "ARRAY":
-            items_schema = schema.get("items", {})
-            kwargs["items"] = convert_schema(items_schema)
-        if prop_type == "OBJECT" and schema.get("properties"):
-            kwargs["properties"] = {
-                k: convert_schema(v) for k, v in schema["properties"].items()
-            }
-            if schema.get("required"):
-                kwargs["required"] = schema["required"]
-        return gtypes.Schema(**kwargs)
 
+def _convert_schema(schema: dict) -> "gtypes.Schema":
+    # Optional[T] arrives as anyOf [T, null] (or type: [T, "null"]). Gemini has
+    # no union type, so keep the first non-null variant.
+    if "anyOf" in schema:
+        variants = [v for v in schema["anyOf"] if v.get("type") != "null"] or [{}]
+        merged = dict(variants[0])
+        if schema.get("description") and "description" not in merged:
+            merged["description"] = schema["description"]
+        schema = merged
+
+    raw_type = schema.get("type", "string")
+    if isinstance(raw_type, list):
+        raw_type = next((t for t in raw_type if t != "null"), "string")
+    prop_type = _TYPE_MAP.get(str(raw_type).lower(), "STRING")
+
+    kwargs: dict = {"type": prop_type}
+    if desc := schema.get("description"):
+        kwargs["description"] = desc
+    if prop_type == "ARRAY":
+        kwargs["items"] = _convert_schema(schema.get("items", {}))
+    if prop_type == "OBJECT" and schema.get("properties"):
+        kwargs["properties"] = {
+            k: _convert_schema(v) for k, v in schema["properties"].items()
+        }
+        if schema.get("required"):
+            kwargs["required"] = schema["required"]
+    return gtypes.Schema(**kwargs)
+
+
+def _object_schema(params: dict) -> "Optional[gtypes.Schema]":
+    """Convert a JSON Schema object node → Gemini Schema, or None if empty."""
+    params = _resolve_refs(params, params.get("$defs", {}))
+    properties = {
+        name: _convert_schema(prop)
+        for name, prop in params.get("properties", {}).items()
+    }
+    if not properties:
+        return None
+    return gtypes.Schema(
+        type="OBJECT",
+        properties=properties,
+        required=params.get("required", []),
+    )
+
+
+def _convert_tools(openai_tools: List[dict]) -> list:
+    """Convert OpenAI tools format → Gemini FunctionDeclaration list."""
     function_declarations = []
     for tool in openai_tools:
         if tool.get("type") != "function":
             continue
         func = tool["function"]
-        params = func.get("parameters", {})
-
-        properties: dict = {}
-        for prop_name, prop_schema in params.get("properties", {}).items():
-            properties[prop_name] = convert_schema(prop_schema)
-
-        gemini_params = None
-        if properties:
-            gemini_params = gtypes.Schema(
-                type="OBJECT",
-                properties=properties,
-                required=params.get("required", []),
-            )
-
         function_declarations.append(
             gtypes.FunctionDeclaration(
                 name=func["name"],
                 description=func.get("description", ""),
-                parameters=gemini_params,
+                parameters=_object_schema(func.get("parameters", {})),
             )
         )
 
     if not function_declarations:
         return []
     return [gtypes.Tool(function_declarations=function_declarations)]
+
+
+# ─── Structured output (response_format) ──────────────────────────────────────
+#
+# The Live API rejects `response_schema` outright ("response_schema not
+# supported in generation config") and this model refuses TEXT modality, so
+# native structured output is unavailable. Instead the schema is declared as a
+# function and the model is told to answer by calling it — the tool-calling
+# path already works over the audio-transcription session. If the model answers
+# in prose anyway, parsing the text as JSON is the fallback.
+
+
+class _Structured(NamedTuple):
+    tool: Optional[object]  # gtypes.Tool, or None for schema-less json_object
+    name: Optional[str]     # function name to look for in the tool call
+    directive: str          # appended to the system prompt
+
+
+_SCHEMA_DIRECTIVE = (
+    "\n\nAnswer only by calling the function `{name}` with the extracted data. "
+    "Do not reply with prose or explanation. "
+    "Keep field values in the same language as the source content."
+)
+
+_JSON_DIRECTIVE = (
+    "\n\nReply with a single valid JSON object and nothing else: "
+    "no markdown fences, no preamble, no explanation. "
+    "Keep values in the same language as the source content."
+)
+
+_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
+
+
+def _build_structured(response_format: Optional[dict]) -> Optional[_Structured]:
+    """Interpret OpenAI's `response_format` field."""
+    if not response_format:
+        return None
+    if not isinstance(response_format, dict):
+        raise InvalidRequestError(400, "response_format must be an object")
+
+    kind = response_format.get("type")
+    if kind in (None, "text"):
+        return None
+
+    if kind == "json_object":
+        return _Structured(tool=None, name=None, directive=_JSON_DIRECTIVE)
+
+    if kind != "json_schema":
+        raise InvalidRequestError(
+            400,
+            f"response_format.type {kind!r} is not supported; "
+            "expected 'text', 'json_object' or 'json_schema'",
+        )
+
+    spec = response_format.get("json_schema")
+    if not isinstance(spec, dict):
+        raise InvalidRequestError(
+            400, "response_format.json_schema must be an object"
+        )
+
+    name = spec.get("name")
+    if not isinstance(name, str) or not name:
+        raise InvalidRequestError(
+            400, "response_format.json_schema.name must be a non-empty string"
+        )
+
+    schema = spec.get("schema")
+    if not isinstance(schema, dict):
+        raise InvalidRequestError(
+            400, "response_format.json_schema.schema must be an object"
+        )
+
+    tool = gtypes.Tool(function_declarations=[
+        gtypes.FunctionDeclaration(
+            name=name,
+            description=spec.get("description")
+            or schema.get("description")
+            or "Return the extracted data in this exact shape.",
+            parameters=_object_schema(schema),
+        )
+    ])
+    return _Structured(tool=tool, name=name, directive=_SCHEMA_DIRECTIVE.format(name=name))
+
+
+def _completion(
+    model: str,
+    message: Message,
+    finish_reason: str,
+    prompt_words: int,
+    completion_words: int = 0,
+) -> ChatCompletionResponse:
+    return ChatCompletionResponse(
+        id=f"chatcmpl-{uuid.uuid4().hex}",
+        object="chat.completion",
+        created=int(time.time()),
+        model=model,
+        choices=[Choice(index=0, message=message, finish_reason=finish_reason)],
+        usage=Usage(
+            prompt_tokens=prompt_words,
+            completion_tokens=completion_words,
+            total_tokens=prompt_words + completion_words,
+        ),
+    )
+
+
+def _parse_json_text(text: str) -> Optional[dict]:
+    """Best-effort JSON out of a prose answer, tolerating markdown fences."""
+    if not text:
+        return None
+    candidate = _FENCE_RE.sub("", text.strip())
+    try:
+        parsed = json.loads(candidate)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 # ─── ChatCompletions ──────────────────────────────────────────────────────────
@@ -195,16 +342,31 @@ class ChatCompletions:
             system_prompt = DEFAULT_SYSTEM_PROMPT
         gemini_tools = _convert_tools(request.tools) if request.tools else []
 
+        structured = _build_structured(request.response_format)
+        if structured:
+            system_prompt += structured.directive
+            if structured.tool is not None:
+                gemini_tools = [*gemini_tools, structured.tool]
+
         gen_kwargs = dict(
             temperature=request.temperature if request.temperature != 1.0 else None,
             max_output_tokens=request.max_tokens,
             top_p=request.top_p if request.top_p != 1.0 else None,
         )
 
-        if request.stream:
+        if request.stream and structured is None:
             return self._stream(parts, system_prompt, request.model, **gen_kwargs)
 
-        return await self._complete(parts, system_prompt, request.model, gemini_tools, **gen_kwargs)
+        response = await self._complete(
+            parts, system_prompt, request.model, gemini_tools, structured, **gen_kwargs
+        )
+
+        # Structured output needs the whole answer before it can be validated,
+        # so a streaming client gets it as one chunk rather than not at all.
+        if request.stream:
+            return self._replay(response)
+
+        return response
 
     async def _complete(
         self,
@@ -212,6 +374,7 @@ class ChatCompletions:
         system_prompt: str,
         model: str,
         tools: Optional[list] = None,
+        structured: Optional[_Structured] = None,
         temperature: Optional[float] = None,
         max_output_tokens: Optional[int] = None,
         top_p: Optional[float] = None,
@@ -252,57 +415,84 @@ class ChatCompletions:
 
         text, function_calls = result
 
+        if structured is not None:
+            payload = None
+            if structured.name:
+                payload = next(
+                    (fc["args"] for fc in function_calls if fc["name"] == structured.name),
+                    None,
+                )
+            # Model may ignore the tool and answer in prose; it is often still JSON.
+            if payload is None and not function_calls:
+                payload = _parse_json_text(text)
+
+            if payload is not None:
+                content = json.dumps(payload, ensure_ascii=False)
+                return _completion(
+                    model,
+                    Message(role="assistant", content=content),
+                    "stop",
+                    prompt_words,
+                    len(content.split()),
+                )
+            if not function_calls:
+                logger.warning(
+                    "response_format requested but the model returned neither a %s call "
+                    "nor JSON; passing the raw text through",
+                    structured.name or "json_object",
+                )
+
         if function_calls:
-            return ChatCompletionResponse(
-                id=f"chatcmpl-{uuid.uuid4().hex}",
-                object="chat.completion",
-                created=int(time.time()),
-                model=model,
-                choices=[
-                    Choice(
-                        index=0,
-                        message=Message(
-                            role="assistant",
-                            content=text or None,
-                            tool_calls=[
-                                ToolCall(
-                                    id=fc["id"],
-                                    function=ToolCallFunction(
-                                        name=fc["name"],
-                                        arguments=json.dumps(fc["args"]),
-                                    ),
-                                )
-                                for fc in function_calls
-                            ],
-                        ),
-                        finish_reason="tool_calls",
-                    )
-                ],
-                usage=Usage(
-                    prompt_tokens=prompt_words,
-                    completion_tokens=0,
-                    total_tokens=prompt_words,
+            return _completion(
+                model,
+                Message(
+                    role="assistant",
+                    content=text or None,
+                    tool_calls=[
+                        ToolCall(
+                            id=fc["id"],
+                            function=ToolCallFunction(
+                                name=fc["name"],
+                                arguments=json.dumps(fc["args"]),
+                            ),
+                        )
+                        for fc in function_calls
+                    ],
                 ),
+                "tool_calls",
+                prompt_words,
             )
 
-        return ChatCompletionResponse(
-            id=f"chatcmpl-{uuid.uuid4().hex}",
-            object="chat.completion",
-            created=int(time.time()),
-            model=model,
-            choices=[
-                Choice(
-                    index=0,
-                    message=Message(role="assistant", content=text),
-                    finish_reason="stop",
-                )
-            ],
-            usage=Usage(
-                prompt_tokens=prompt_words,
-                completion_tokens=len(text.split()),
-                total_tokens=prompt_words + len(text.split()),
-            ),
+        return _completion(
+            model,
+            Message(role="assistant", content=text),
+            "stop",
+            prompt_words,
+            len(text.split()),
         )
+
+    async def _replay(self, response: ChatCompletionResponse) -> AsyncIterator[dict]:
+        """Emit a finished completion as SSE chunks."""
+        choice = response.choices[0]
+        base = {
+            "id": response.id,
+            "object": "chat.completion.chunk",
+            "created": response.created,
+            "model": response.model,
+        }
+
+        yield {**base, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
+        if choice.message and choice.message.content:
+            yield {
+                **base,
+                "choices": [
+                    {"index": 0, "delta": {"content": choice.message.content}, "finish_reason": None}
+                ],
+            }
+        yield {
+            **base,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": choice.finish_reason}],
+        }
 
     async def _stream(
         self,
