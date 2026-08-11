@@ -21,6 +21,7 @@ Transforms the **Google Gemini Live API** into an **OpenAI-compatible REST API**
 - Supports both **streaming** (SSE) and **non-streaming** responses
 - Converts multi-turn message history to Gemini Live API format automatically
 - Supports **function/tool calling** with automatic OpenAI → Gemini format conversion
+- Accepts **images** in the OpenAI `image_url` content format
 - Retries failed requests automatically (up to 3 attempts, exponential backoff)
 
 **Use cases:**
@@ -72,6 +73,7 @@ curl -X POST http://localhost:8000/openai/v1/chat/completions \
 
 - **OpenAI-compatible** — works as a drop-in replacement for the OpenAI API
 - **Streaming support** — real-time SSE chunks via Gemini Live API
+- **Image input (vision)** — OpenAI `image_url` content parts with base64 `data:` URLs, sent to Gemini as `inline_data`
 - **Function/tool calling** — full OpenAI tool-call format; automatically converted to Gemini `FunctionDeclaration`
 - **Auto-retry** — up to 3 attempts with exponential backoff (2s → 30s); auth errors are not retried
 - **Optional auth** — protect your server with a bearer token (`SERVER_API_KEY`)
@@ -120,6 +122,43 @@ stream = await client.chat.completions.create(
 async for chunk in stream:
     print(chunk.choices[0].delta.content or "", end="", flush=True)
 ```
+
+### Image Input (Vision)
+
+Send images as OpenAI `image_url` content parts. The URL must be a base64 `data:` URL — remote `http(s)` URLs are **not** fetched by the server.
+
+```python
+import base64
+
+with open("photo.jpg", "rb") as f:
+    b64 = base64.b64encode(f.read()).decode()
+
+response = await client.chat.completions.create(
+    model="gemini",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Có gì trong ảnh này?"},
+            {"type": "image_url", "image_url": {
+                "url": f"data:image/jpeg;base64,{b64}"
+            }},
+        ],
+    }],
+)
+print(response.choices[0].message.content)
+```
+
+Images from earlier turns are re-sent with every request, so follow-up questions about a previous image work. Text and images keep the order you sent them in.
+
+| Constraint | Value |
+|---|---|
+| Supported types | `image/png`, `image/jpeg`, `image/webp`, `image/heic`, `image/heif` |
+| Source | base64 `data:` URLs only |
+| Total image size | 15 MB per request (Gemini caps the whole request at 20 MB) |
+| Allowed roles | `user` messages only |
+| `detail` field | accepted and ignored |
+
+Anything violating these returns `400` before a Gemini session is opened, so a malformed request costs no quota.
 
 ### Function/Tool Calling
 
@@ -208,7 +247,7 @@ Once running, visit `http://localhost:8000/docs` for interactive API docs powere
 | Field | Type | Description |
 |---|---|---|
 | `model` | string | Any string (passed through; actual model is `gemini-3.1-flash-live-preview`) |
-| `messages` | array | OpenAI message format (`system`, `user`, `assistant`, `tool`) |
+| `messages` | array | OpenAI message format (`system`, `user`, `assistant`, `tool`); `content` may be a string or a list of `text` / `image_url` parts |
 | `stream` | bool | Enable SSE streaming (default: `false`) |
 | `tools` | array | OpenAI function definitions (converted to Gemini `FunctionDeclaration`) |
 | `tool_choice` | string/object | Accepted but not forwarded to Gemini |
@@ -220,6 +259,7 @@ Once running, visit `http://localhost:8000/docs` for interactive API docs powere
 
 | HTTP Status | Exception | Cause |
 |---|---|---|
+| `400` | `InvalidRequestError` | Malformed content part — bad data URL, unsupported image type, oversized payload, image outside a `user` message |
 | `401` | `AuthError` | Missing or invalid API key |
 | `429` | `RateLimitError` | Gemini quota exceeded |
 | `5xx` | `ServerError` | Gemini upstream error |
@@ -230,7 +270,7 @@ Once running, visit `http://localhost:8000/docs` for interactive API docs powere
 
 ```
 gemini-fri/
-├── gemini_live_text.py          # Gemini Live API core (chat_once, chat_stream, chat_once_ex)
+├── gemini_live_text.py          # Standalone CLI demo (text only, independent of sdk/)
 ├── main.py                      # FastAPI app & routes
 ├── requirements.txt
 ├── pyproject.toml
@@ -239,7 +279,10 @@ gemini-fri/
     ├── types.py                 # MessageRole, FinishReason enums
     ├── core/
     │   ├── models.py            # Pydantic schemas (request / response / tool call)
-    │   └── exceptions.py        # SDKError, APIError, AuthError, RateLimitError, ServerError
+    │   ├── content.py           # OpenAI content → Gemini parts (text + images), validation
+    │   └── exceptions.py        # SDKError, APIError, InvalidRequestError, AuthError, RateLimitError, ServerError
+    ├── providers/
+    │   └── gemini_live.py       # Gemini Live API client (chat_once, chat_stream, chat_once_ex)
     └── resources/
         └── chat/
             └── completions.py   # ChatCompletions.create(), retry logic, tool conversion
@@ -254,17 +297,23 @@ Client (OpenAI SDK / curl)
 FastAPI  main.py
         │  auth check, request routing
         ▼
+sdk/core/content.py
+        │  converts OpenAI messages → (system_prompt, list[Part])
+        │  validates + decodes base64 images → inline_data parts
+        ▼
 sdk/resources/chat/completions.py
-        │  converts OpenAI messages → (system_prompt, user_message)
-        │  converts OpenAI tools    → Gemini FunctionDeclaration
+        │  converts OpenAI tools → Gemini FunctionDeclaration
         │  wraps calls with tenacity retry (3 attempts, exp backoff)
         ▼
-gemini_live_text.py
+sdk/providers/gemini_live.py
         │  chat_once / chat_stream / chat_once_ex
+        │  sends one turn via send_client_content
         │  uses AUDIO modality + output_audio_transcription
         ▼
 Google Gemini Live API  (model: gemini-3.1-flash-live-preview)
 ```
+
+> **Why `send_client_content`:** the Live API also accepts `send_realtime_input`, but that path gives no ordering guarantee, and images carry enough preprocessing cost that a following text message can reach the model first. `send_client_content` sends text and images as one ordered turn.
 
 > **Note on audio transcription:** The Gemini Live API session is opened with `response_modalities=["AUDIO"]` and `output_audio_transcription` enabled. Text is extracted from the transcription, not from a text-mode response. This is a quirk of the Live API's current interface.
 

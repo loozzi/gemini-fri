@@ -9,6 +9,10 @@ class APIError(SDKError):
         super().__init__(f"[{status_code}] {message}")
 
 
+class InvalidRequestError(APIError):
+    """400 Bad Request"""
+
+
 class AuthError(APIError):
     """401 Unauthorized"""
 

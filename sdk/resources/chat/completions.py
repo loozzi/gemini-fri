@@ -13,6 +13,9 @@ from tenacity import (
     before_sleep_log,
 )
 
+from google.genai import types as gtypes
+
+from sdk.core.content import build_parts, estimate_tokens, parts_text
 from sdk.core.exceptions import AuthError, RateLimitError
 from sdk.core.models import (
     ChatCompletionRequest,
@@ -24,7 +27,7 @@ from sdk.core.models import (
     ToolCallFunction,
     Usage,
 )
-from gemini_live_text import (
+from sdk.providers.gemini_live import (
     chat_once,
     chat_once_ex,
     chat_stream,
@@ -69,10 +72,6 @@ class TokenBucket:
                 self._tokens -= tokens
 
 
-def _estimate_tokens(text: str) -> int:
-    return max(1, len(text) // 4)
-
-
 # ─── Retry ────────────────────────────────────────────────────────────────────
 
 
@@ -115,37 +114,6 @@ def _translate_exc(exc: Exception) -> Exception:
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
-
-
-def _build_gemini_prompt(messages: List[Message]) -> tuple[str, str]:
-    """Convert OpenAI-format messages → (system_prompt, conversation_text)."""
-    system_parts: list[str] = []
-    conversation_parts: list[str] = []
-
-    for msg in messages:
-        if msg.role == "system":
-            content = msg.content if isinstance(msg.content, str) else str(msg.content)
-            system_parts.append(content)
-        elif msg.role == "user":
-            content = msg.content if isinstance(msg.content, str) else str(msg.content)
-            conversation_parts.append(f"User: {content}")
-        elif msg.role == "assistant":
-            if msg.tool_calls:
-                calls_str = "; ".join(
-                    f"{tc.function.name}({tc.function.arguments})"
-                    for tc in msg.tool_calls
-                )
-                conversation_parts.append(f"Assistant called: {calls_str}")
-            elif msg.content:
-                content = msg.content if isinstance(msg.content, str) else str(msg.content)
-                conversation_parts.append(f"Assistant: {content}")
-        elif msg.role == "tool":
-            content = msg.content if isinstance(msg.content, str) else str(msg.content)
-            conversation_parts.append(f"Tool result [{msg.tool_call_id}]: {content}")
-
-    system_prompt = "\n".join(system_parts) if system_parts else DEFAULT_SYSTEM_PROMPT
-    user_message = "\n".join(conversation_parts)
-    return system_prompt, user_message
 
 
 def _convert_tools(openai_tools: List[dict]) -> list:
@@ -222,7 +190,9 @@ class ChatCompletions:
         self,
         request: ChatCompletionRequest,
     ) -> Union[ChatCompletionResponse, AsyncIterator[dict]]:
-        system_prompt, user_message = _build_gemini_prompt(request.messages)
+        system_prompt, parts = build_parts(request.messages)
+        if system_prompt is None:
+            system_prompt = DEFAULT_SYSTEM_PROMPT
         gemini_tools = _convert_tools(request.tools) if request.tools else []
 
         gen_kwargs = dict(
@@ -232,13 +202,13 @@ class ChatCompletions:
         )
 
         if request.stream:
-            return self._stream(user_message, system_prompt, request.model, **gen_kwargs)
+            return self._stream(parts, system_prompt, request.model, **gen_kwargs)
 
-        return await self._complete(user_message, system_prompt, request.model, gemini_tools, **gen_kwargs)
+        return await self._complete(parts, system_prompt, request.model, gemini_tools, **gen_kwargs)
 
     async def _complete(
         self,
-        user_message: str,
+        parts: List[gtypes.Part],
         system_prompt: str,
         model: str,
         tools: Optional[list] = None,
@@ -246,7 +216,8 @@ class ChatCompletions:
         max_output_tokens: Optional[int] = None,
         top_p: Optional[float] = None,
     ) -> ChatCompletionResponse:
-        await self._bucket.consume(_estimate_tokens(user_message))
+        await self._bucket.consume(estimate_tokens(parts))
+        prompt_words = len(parts_text(parts).split())
 
         result = None
         async for attempt in AsyncRetrying(**_RETRY_CONFIG):
@@ -254,7 +225,7 @@ class ChatCompletions:
                 try:
                     if tools:
                         text, function_calls = await chat_once_ex(
-                            message=user_message,
+                            parts=parts,
                             api_key=self._api_key,
                             system_prompt=system_prompt,
                             tools=tools,
@@ -264,7 +235,7 @@ class ChatCompletions:
                         )
                     else:
                         text = await chat_once(
-                            message=user_message,
+                            parts=parts,
                             api_key=self._api_key,
                             system_prompt=system_prompt,
                             temperature=temperature,
@@ -308,9 +279,9 @@ class ChatCompletions:
                     )
                 ],
                 usage=Usage(
-                    prompt_tokens=len(user_message.split()),
+                    prompt_tokens=prompt_words,
                     completion_tokens=0,
-                    total_tokens=len(user_message.split()),
+                    total_tokens=prompt_words,
                 ),
             )
 
@@ -327,22 +298,22 @@ class ChatCompletions:
                 )
             ],
             usage=Usage(
-                prompt_tokens=len(user_message.split()),
+                prompt_tokens=prompt_words,
                 completion_tokens=len(text.split()),
-                total_tokens=len(user_message.split()) + len(text.split()),
+                total_tokens=prompt_words + len(text.split()),
             ),
         )
 
     async def _stream(
         self,
-        user_message: str,
+        parts: List[gtypes.Part],
         system_prompt: str,
         model: str,
         temperature: Optional[float] = None,
         max_output_tokens: Optional[int] = None,
         top_p: Optional[float] = None,
     ) -> AsyncIterator[dict]:
-        await self._bucket.consume(_estimate_tokens(user_message))
+        await self._bucket.consume(estimate_tokens(parts))
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
@@ -359,7 +330,7 @@ class ChatCompletions:
         while attempt_count < 5:
             try:
                 async for text_chunk in chat_stream(
-                    message=user_message,
+                    parts=parts,
                     api_key=self._api_key,
                     system_prompt=system_prompt,
                     temperature=temperature,

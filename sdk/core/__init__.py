@@ -6,7 +6,14 @@ from .models import (
     ChoiceDelta,
     Usage,
 )
-from .exceptions import SDKError, APIError, AuthError, RateLimitError, ServerError
+from .exceptions import (
+    SDKError,
+    APIError,
+    InvalidRequestError,
+    AuthError,
+    RateLimitError,
+    ServerError,
+)
 
 __all__ = [
     "Message",
@@ -17,6 +24,7 @@ __all__ = [
     "Usage",
     "SDKError",
     "APIError",
+    "InvalidRequestError",
     "AuthError",
     "RateLimitError",
     "ServerError",
