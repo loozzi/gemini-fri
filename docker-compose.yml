@@ -1,0 +1,26 @@
+services:
+  gemini-fri:
+    build: .
+    image: gemini-fri:latest
+    container_name: gemini-fri
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      # Optional. The /openai/v1 surface always takes the key from the
+      # Authorization header; the Ollama surface falls back to this because
+      # most Ollama clients cannot set headers.
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+    env_file:
+      - path: .env
+        required: false
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3

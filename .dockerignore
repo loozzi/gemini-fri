@@ -1,0 +1,37 @@
+# Virtual environments — the image builds its own
+.venv
+venv
+
+# Python artefacts
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Secrets — never bake these into an image
+.env
+*.pem
+
+# VCS and tooling
+.git
+.gitignore
+.github
+.claude
+.python-version
+
+# Docs and local scratch
+docs/
+README.md
+*.md
+
+# Local experiments, not part of the service
+test.py
+img.png
+gemini_live_text.py
+
+# Docker files themselves
+Dockerfile
+docker-compose.yml
+.dockerignore

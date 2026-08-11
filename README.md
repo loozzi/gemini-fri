@@ -70,6 +70,33 @@ curl -X POST http://localhost:8000/openai/v1/chat/completions \
 
 ---
 
+## Docker
+
+```bash
+docker compose up -d --build
+```
+
+Served on `http://localhost:8000`. Change it with `PORT=9000 docker compose up -d`.
+
+To supply a key for the Ollama surface (the OpenAI surface always uses the request header), put it in a `.env` next to `docker-compose.yml`:
+
+```
+GEMINI_API_KEY=your_key
+```
+
+Without compose:
+
+```bash
+docker build -t gemini-fri .
+docker run -d -p 8000:8000 -e GEMINI_API_KEY=your_key gemini-fri
+```
+
+The image is a two-stage build: `uv sync --locked` resolves dependencies in a builder stage, and only the resulting virtualenv plus the application code ship in a `python:3.13-slim` runtime — no uv, no compiler, roughly 200 MB. It runs as a non-root user and carries a `HEALTHCHECK` against `/health`.
+
+> No BuildKit cache mounts are used, so `docker build` works with the classic builder and does not require `buildx`.
+
+---
+
 ## Features
 
 - **OpenAI-compatible** — works as a drop-in replacement for the OpenAI API
@@ -280,11 +307,15 @@ client.chat(model=MODEL, stream=False, format={
 ```
 
 ```bash
-curl http://localhost:8000/api/chat -d '{
-  "model": "gemini-3.1-flash-live-preview:latest",
-  "messages": [{"role": "user", "content": "Hello!"}]
-}'
+curl http://localhost:8000/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-3.1-flash-live-preview:latest",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
 ```
+
+> Unlike real Ollama, which decodes the body whatever the content type, this server needs `Content-Type: application/json`. The official `ollama` clients set it; hand-written `curl` calls must too.
 
 **Authentication.** Ollama has no auth, and most Ollama clients cannot set headers. So this surface takes the key from `Authorization: Bearer <key>` if present, otherwise from the `GEMINI_API_KEY` environment variable:
 
