@@ -8,7 +8,9 @@ gives no ordering guarantee, and images carry enough preprocessing cost that a
 following text message can reach the model first.
 """
 
+import logging
 import os
+import re
 import uuid as _uuid
 from typing import AsyncGenerator, List, Optional
 
@@ -17,8 +19,11 @@ from google import genai
 from google.genai import types
 
 from sdk.core.model_registry import DEFAULT_MODEL_ID, resolve as resolve_model
+from sdk.providers import live_sessions
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_API_KEY")
 # Kept as the module-level default; the servable set lives in sdk.core.model_registry.
@@ -162,6 +167,88 @@ async def chat_stream(
                 break
 
 
+async def _open(api_key: str, model_id: str, config: types.LiveConnectConfig):
+    """Enter a Live connection by hand, so it can outlive the request that opened it."""
+    connection = _client(api_key).aio.live.connect(model=model_id, config=config)
+    session = await connection.__aenter__()
+    return connection, session
+
+
+async def _read_turn(session) -> tuple[str, list]:
+    """Read until the model ends its turn or pauses it to call tools."""
+    text_parts: list[str] = []
+    calls: list = []
+
+    async for response in session.receive():
+        server_content = response.server_content
+        if server_content:
+            transcription = server_content.output_transcription
+            if transcription and transcription.text:
+                text_parts.append(transcription.text)
+            if server_content.turn_complete:
+                break
+
+        if response.tool_call:
+            calls.extend(response.tool_call.function_calls)
+            break
+
+    return "".join(text_parts), calls
+
+
+# A turn with no letter or digit in it — an empty transcript, "\n\n", a stray
+# "```" — is not an answer, yet native-audio models end tool loops that way
+# often: 4 of 4 measured agent runs with default thinking. Agent clients show it
+# as an empty reply and wait for the user to type "continue", so the server says
+# it once instead, in the same session. In those runs every nudge drew a real
+# summary; one also re-ran a read-only check.
+_NUDGE = "Continue. If the task is already complete, reply with a one-sentence summary of what you did."
+_HAS_WORD = re.compile(r"\w")
+
+
+async def _read_answer(session) -> tuple[str, list]:
+    """`_read_turn`, nudging the model once if the turn came back empty.
+
+    If the nudge still yields nothing, the original turn is returned so the
+    reply is never worse than what the model first said.
+    """
+    text, calls = await _read_turn(session)
+    if calls or _HAS_WORD.search(text):
+        return text, calls
+
+    logger.info("Model ended its turn without an answer; nudging it once")
+    await session.send_client_content(
+        turns=types.Content(role="user", parts=[types.Part(text=_NUDGE)]),
+        turn_complete=True,
+    )
+    retry_text, retry_calls = await _read_turn(session)
+    if retry_calls or _HAS_WORD.search(retry_text):
+        return retry_text, retry_calls
+    return text, calls
+
+
+async def _settle(connection, session, model_id: str, text: str, calls: list) -> tuple[str, list[dict]]:
+    """Park the session while the model waits on tools; close it otherwise."""
+    if not calls:
+        await live_sessions.close_connection(connection)
+        return text, []
+
+    function_calls: list[dict] = []
+    pending: dict[str, live_sessions.PendingCall] = {}
+    for fc in calls:
+        call_id = fc.id or f"call_{_uuid.uuid4().hex[:8]}"
+        function_calls.append({
+            "id": call_id,
+            "name": fc.name,
+            "args": dict(fc.args) if fc.args else {},
+        })
+        pending[call_id] = live_sessions.PendingCall(name=fc.name, gemini_id=fc.id)
+
+    await live_sessions.park(live_sessions.ParkedSession(
+        connection=connection, session=session, model=model_id, pending=pending,
+    ))
+    return text, function_calls
+
+
 async def chat_once_ex(
     parts: List[types.Part],
     api_key: str = DEFAULT_API_KEY,
@@ -172,13 +259,47 @@ async def chat_once_ex(
     temperature: Optional[float] = None,
     max_output_tokens: Optional[int] = None,
     top_p: Optional[float] = None,
+    tool_results: Optional[List[tuple[str, str]]] = None,
 ) -> tuple[str, list[dict]]:
     """
     Extended chat_once with function calling support.
     Returns (text, function_calls) where function_calls is a list of
     {"id": str, "name": str, "args": dict}.
+
+    When the model calls tools its session is parked rather than closed, and
+    `tool_results` — the (call id, output) pairs ending the next request's
+    history — resume it through `send_tool_response`. That is the only form in
+    which the Live API takes tool results: `function_call` parts replayed in
+    client content are rejected with 1007, and in the flattened transcript that
+    `parts` carries the model does not recognise its own finished steps, so
+    agents repeat them or stop mid-task. `parts` is still replayed whenever no
+    parked session matches: a first request, an expired session, or a client
+    such as Ollama that sends no call ids.
     """
-    client = _client(api_key)
+    model_id = resolve_model(model)
+
+    entry = None
+    if tool_results:
+        entry = await live_sessions.claim([call_id for call_id, _ in tool_results], model_id)
+
+    if entry is not None:
+        try:
+            await entry.session.send_tool_response(function_responses=[
+                types.FunctionResponse(
+                    name=entry.pending[call_id].name,
+                    response={"output": output},
+                    **({"id": entry.pending[call_id].gemini_id} if entry.pending[call_id].gemini_id else {}),
+                )
+                for call_id, output in tool_results
+            ])
+            text, calls = await _read_answer(entry.session)
+        except Exception as exc:
+            # Upstream may have closed the session while the client ran its tools.
+            logger.warning("Parked Live session could not resume (%s); replaying history", exc)
+            await entry.close()
+        else:
+            return await _settle(entry.connection, entry.session, model_id, text, calls)
+
     config = _live_config(
         system_prompt,
         tools=tools,
@@ -187,28 +308,11 @@ async def chat_once_ex(
         top_p=top_p,
         thinking_budget=thinking_budget,
     )
-
-    text_parts: list[str] = []
-    function_calls: list[dict] = []
-
-    async with client.aio.live.connect(model=resolve_model(model), config=config) as session:
+    connection, session = await _open(api_key, model_id, config)
+    try:
         await _send_turn(session, parts)
-
-        async for response in session.receive():
-            server_content = response.server_content
-            if server_content:
-                if server_content.output_transcription:
-                    text_parts.append(server_content.output_transcription.text)
-                if server_content.turn_complete:
-                    break
-
-            if response.tool_call:
-                for fc in response.tool_call.function_calls:
-                    function_calls.append({
-                        "id": getattr(fc, "id", None) or f"call_{_uuid.uuid4().hex[:8]}",
-                        "name": fc.name,
-                        "args": dict(fc.args) if fc.args else {},
-                    })
-                break
-
-    return "".join(text_parts), function_calls
+        text, calls = await _read_answer(session)
+    except BaseException:
+        await live_sessions.close_connection(connection)
+        raise
+    return await _settle(connection, session, model_id, text, calls)

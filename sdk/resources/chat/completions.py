@@ -17,7 +17,7 @@ from tenacity import (
 from google.genai import types as gtypes
 
 from sdk.core.content import build_parts, estimate_tokens, parts_text
-from sdk.core.exceptions import AuthError, InvalidRequestError, RateLimitError
+from sdk.core.exceptions import AuthError, InvalidRequestError, RateLimitError, ServerError
 from sdk.core.models import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -28,6 +28,7 @@ from sdk.core.models import (
     ToolCallFunction,
     Usage,
 )
+from sdk.providers import live_sessions
 from sdk.providers.gemini_live import (
     chat_once,
     chat_once_ex,
@@ -109,6 +110,10 @@ def _translate_exc(exc: Exception) -> Exception:
                 return RateLimitError(429, msg)
             if code == 401 or "401" in msg:
                 return AuthError(401, msg)
+            # 1011 is the Live API's "Internal error occurred" close: the
+            # upstream failed, not the request, so it surfaces as a 502.
+            if code == 1011:
+                return ServerError(502, msg)
     except (ImportError, AttributeError):
         pass
     return exc
@@ -358,6 +363,28 @@ def _parse_json_text(text: str) -> Optional[dict]:
     return parsed if isinstance(parsed, dict) else None
 
 
+def _tool_output(content: Optional[Union[str, List[dict]]]) -> str:
+    if isinstance(content, list):
+        return "\n".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+    return "" if content is None else str(content)
+
+
+def _trailing_tool_results(messages: List[Message]) -> List[tuple[str, str]]:
+    """(call id, output) for the tool messages that end the history.
+
+    Those are the results a parked Live session is waiting on. Any later
+    message — a user typing "continue", say — means there is nothing to resume.
+    """
+    results: List[tuple[str, str]] = []
+    for msg in reversed(messages):
+        if msg.role != "tool":
+            break
+        if msg.tool_call_id:
+            results.append((msg.tool_call_id, _tool_output(msg.content)))
+    results.reverse()
+    return results
+
+
 # ─── ChatCompletions ──────────────────────────────────────────────────────────
 
 
@@ -395,7 +422,13 @@ class ChatCompletions:
             return self._stream(parts, system_prompt, request.model, **gen_kwargs)
 
         response = await self._complete(
-            parts, system_prompt, request.model, gemini_tools, structured, **gen_kwargs
+            parts,
+            system_prompt,
+            request.model,
+            gemini_tools,
+            structured,
+            tool_results=_trailing_tool_results(request.messages),
+            **gen_kwargs,
         )
 
         if request.stream:
@@ -414,6 +447,7 @@ class ChatCompletions:
         max_output_tokens: Optional[int] = None,
         top_p: Optional[float] = None,
         thinking_budget: Optional[int] = None,
+        tool_results: Optional[List[tuple[str, str]]] = None,
     ) -> ChatCompletionResponse:
         await self._bucket.consume(estimate_tokens(parts))
         prompt_words = len(parts_text(parts).split())
@@ -433,6 +467,7 @@ class ChatCompletions:
                             max_output_tokens=max_output_tokens,
                             top_p=top_p,
                             thinking_budget=thinking_budget,
+                            tool_results=tool_results,
                         )
                     else:
                         text = await chat_once(
@@ -467,6 +502,10 @@ class ChatCompletions:
                 payload = _parse_json_text(text)
 
             if payload is not None:
+                if function_calls:
+                    # The schema call is the answer, not a tool to run: no
+                    # results will come back for the session that made it.
+                    await live_sessions.discard(fc["id"] for fc in function_calls)
                 content = json.dumps(payload, ensure_ascii=False)
                 return _completion(
                     model,

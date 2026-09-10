@@ -101,9 +101,24 @@ async def create_chat_completion(
     completions = ChatCompletions(api_key=api_key)
 
     if request.stream:
+        # Requests with tools or a schema do all their work inside create().
+        # Awaiting it before the response starts lets a failure there become a
+        # real error status instead of a stream that dies after its 200 header.
+        chunks = await completions.create(request)
+
         async def event_stream():
-            async for chunk in await completions.create(request):
-                yield f"data: {json.dumps(chunk)}\n\n"
+            try:
+                async for chunk in chunks:
+                    yield f"data: {json.dumps(chunk)}\n\n"
+            except Exception as exc:
+                # Headers are already sent, so the status cannot change. Without
+                # an error event, clients record the turn as finished for an
+                # "unknown" reason and the agent loop just stops.
+                logger.warning("Stream failed mid-response: %s", exc)
+                message = exc.message if isinstance(exc, APIError) else str(exc)
+                error = {"error": {"message": message, "type": "server_error"}}
+                yield f"data: {json.dumps(error)}\n\n"
+                return
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
