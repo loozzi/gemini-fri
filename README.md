@@ -103,12 +103,96 @@ The image is a two-stage build: `uv sync --locked` resolves dependencies in a bu
 - **Streaming support** — real-time SSE chunks via Gemini Live API
 - **Image input (vision)** — OpenAI `image_url` content parts with base64 `data:` URLs, sent to Gemini as `inline_data`
 - **Structured output** — `response_format` with `json_schema` or `json_object`; works with `with_structured_output()` and `client.beta.chat.completions.parse()`
+- **Model selection** — `GET /openai/v1/models` lists the servable models; pass any of those ids as `model` and the request runs on that model. Ids are the real Gemini model names, so nothing has to be mapped
 - **Ollama-compatible surface** — `/api/chat` (NDJSON streaming), `/api/tags`, `/api/show`, `/api/version`; images, tools and `format` all supported
+- **Reasoning control** — `reasoning_effort` (`minimal`/`low`/`medium`/`high`) maps to a Gemini thinking budget; Ollama's `think` maps onto the same thing
 - **Function/tool calling** — full OpenAI tool-call format; automatically converted to Gemini `FunctionDeclaration`
 - **Auto-retry** — up to 3 attempts with exponential backoff (2s → 30s); auth errors are not retried
 - **Optional auth** — protect your server with a bearer token (`SERVER_API_KEY`)
 - **Multi-turn context** — system + user + assistant + tool message history handled automatically
 - **Interactive docs** — Swagger UI at `/docs`
+
+---
+
+## Models
+
+`GET /openai/v1/models` (no auth required) returns what this server can run:
+
+```bash
+curl http://localhost:8000/openai/v1/models
+```
+
+| id | notes |
+| --- | --- |
+| `gemini-3.1-flash-live-preview` | default; used when `model` is omitted or unrecognised |
+| `gemini-2.5-flash-native-audio-preview-12-2025` | Gemini 2.5 Flash native audio, 12-2025 preview |
+| `gemini-2.5-flash-native-audio-latest` | Gemini 2.5 Flash native audio, latest |
+| `gemini-2.5-flash-native-audio-preview-09-2025` | Gemini 2.5 Flash native audio, 09-2025 preview |
+
+All four support tools and image input. Ids are exactly the strings Gemini's
+Live API expects, so `model` here is the same name you would use against Google
+directly.
+
+Seven Gemini models advertise `bidiGenerateContent`, but only these four hold a
+text conversation over an audio-transcription session — `gemini-3.5-transcribe-live`
+and `gemini-robotics-er-2-streaming-preview` reject the AUDIO modality with a
+`1007` close, and `gemini-3.5-live-translate-preview` never answers. Listing
+them would only hand out ids that fail at request time.
+
+An unknown `model` is **not** an error on `/chat/completions`: the request runs
+on the default model, which keeps existing client configs working. Ask for one
+by name instead and you do get a 404:
+
+```bash
+curl http://localhost:8000/openai/v1/models/gpt-4o
+# {"error": {"message": "The model 'gpt-4o' does not exist", ..., "code": "model_not_found"}}
+```
+
+Ollama clients see the same set through `GET /api/tags`, tagged `:latest`
+(e.g. `gemini-2.5-flash-native-audio-preview-12-2025:latest`); the tag is
+stripped before the model is resolved.
+
+---
+
+## Reasoning effort
+
+Gemini Live takes a *thinking budget* in tokens. `reasoning_effort` maps onto it:
+
+| `reasoning_effort` | thinking budget | time to first token* |
+| --- | --- | --- |
+| omitted | model default | — |
+| `minimal` / `none` | 0 (off) | 1.26s |
+| `low` | 512 | 3.31s |
+| `medium` | 2048 | 3.76s |
+| `high` | 8192 | 4.45s |
+
+<sub>* single measurement on `gemini-2.5-flash-native-audio-preview-12-2025`; treat as a trend, not a benchmark.</sub>
+
+```bash
+curl -X POST http://localhost:8000/openai/v1/chat/completions \
+  -H "Authorization: Bearer $GEMINI_API_KEY" \
+  -d '{"model": "gemini-2.5-flash-native-audio-preview-12-2025",
+       "messages": [{"role": "user", "content": "..."}],
+       "reasoning_effort": "minimal", "stream": true}'
+```
+
+Omitting the field sends no thinking config at all, so each model keeps its own
+default — existing clients are unaffected. An unrecognised value is a 400.
+
+Ollama clients use `think` instead, and it reaches the same setting:
+`think: false` → `minimal`, `think: "low"|"medium"|"high"` → that level.
+`think: true` is left alone, since these models already reason by default and
+naming a level would cap a budget the client never asked to cap.
+
+**Where the saving shows up:** on `stream: true`, where it cuts time to first
+token (measured through this server: 3.94s at `high` → 1.25s at `minimal`).
+Non-streaming requests see little change — `chat_once` waits for the Live API's
+`turn_complete`, which only arrives after the model has finished streaming the
+audio this server discards, and that tail dominates the total.
+
+Note that `gemini-3.1-flash-live-preview`, the default model, barely thinks to
+begin with — turning reasoning off moved its first token by ~0.06s, inside the
+noise. The setting matters on the native-audio models.
 
 ---
 

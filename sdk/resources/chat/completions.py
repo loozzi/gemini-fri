@@ -292,6 +292,39 @@ def _build_structured(response_format: Optional[dict]) -> Optional[_Structured]:
     return _Structured(tool=tool, name=name, directive=_SCHEMA_DIRECTIVE.format(name=name))
 
 
+# ─── Reasoning effort ─────────────────────────────────────────────────────────
+#
+# Gemini Live takes a thinking budget in tokens, not a named level. The budgets
+# below were picked by measuring time-to-first-token on
+# gemini-2.5-flash-native-audio-preview-12-2025: 0 → 1.26s, 512 → 3.31s,
+# 2048 → 3.76s, 8192 → 4.45s. Every value is accepted by the API, so the levels
+# map onto a real gradient rather than collapsing to on/off.
+#
+# Leaving `reasoning_effort` unset sends no thinking config at all, which keeps
+# each model's own default — the behaviour clients get today.
+
+_REASONING_BUDGETS = {
+    "none": 0,
+    "minimal": 0,
+    "low": 512,
+    "medium": 2048,
+    "high": 8192,
+}
+
+
+def _thinking_budget(reasoning_effort: Optional[str]) -> Optional[int]:
+    if reasoning_effort is None:
+        return None
+    budget = _REASONING_BUDGETS.get(str(reasoning_effort).lower())
+    if budget is None:
+        raise InvalidRequestError(
+            400,
+            f"reasoning_effort {reasoning_effort!r} is not supported; expected one of "
+            + ", ".join(sorted(_REASONING_BUDGETS)),
+        )
+    return budget
+
+
 def _completion(
     model: str,
     message: Message,
@@ -352,6 +385,7 @@ class ChatCompletions:
             temperature=request.temperature if request.temperature != 1.0 else None,
             max_output_tokens=request.max_tokens,
             top_p=request.top_p if request.top_p != 1.0 else None,
+            thinking_budget=_thinking_budget(request.reasoning_effort),
         )
 
         # The streaming path cannot carry tools or a schema, so those requests
@@ -379,6 +413,7 @@ class ChatCompletions:
         temperature: Optional[float] = None,
         max_output_tokens: Optional[int] = None,
         top_p: Optional[float] = None,
+        thinking_budget: Optional[int] = None,
     ) -> ChatCompletionResponse:
         await self._bucket.consume(estimate_tokens(parts))
         prompt_words = len(parts_text(parts).split())
@@ -391,20 +426,24 @@ class ChatCompletions:
                         text, function_calls = await chat_once_ex(
                             parts=parts,
                             api_key=self._api_key,
+                            model=model,
                             system_prompt=system_prompt,
                             tools=tools,
                             temperature=temperature,
                             max_output_tokens=max_output_tokens,
                             top_p=top_p,
+                            thinking_budget=thinking_budget,
                         )
                     else:
                         text = await chat_once(
                             parts=parts,
                             api_key=self._api_key,
+                            model=model,
                             system_prompt=system_prompt,
                             temperature=temperature,
                             max_output_tokens=max_output_tokens,
                             top_p=top_p,
+                            thinking_budget=thinking_budget,
                         )
                         function_calls = []
                 except Exception as exc:
@@ -527,6 +566,7 @@ class ChatCompletions:
         temperature: Optional[float] = None,
         max_output_tokens: Optional[int] = None,
         top_p: Optional[float] = None,
+        thinking_budget: Optional[int] = None,
     ) -> AsyncIterator[dict]:
         await self._bucket.consume(estimate_tokens(parts))
 
@@ -547,10 +587,12 @@ class ChatCompletions:
                 async for text_chunk in chat_stream(
                     parts=parts,
                     api_key=self._api_key,
+                    model=model,
                     system_prompt=system_prompt,
                     temperature=temperature,
                     max_output_tokens=max_output_tokens,
                     top_p=top_p,
+                    thinking_budget=thinking_budget,
                 ):
                     yield {
                         "id": completion_id,

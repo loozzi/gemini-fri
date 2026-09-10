@@ -16,10 +16,13 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
+from sdk.core.model_registry import DEFAULT_MODEL_ID, resolve as resolve_model
+
 load_dotenv()
 
 DEFAULT_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_API_KEY")
-MODEL = "gemini-3.1-flash-live-preview"
+# Kept as the module-level default; the servable set lives in sdk.core.model_registry.
+MODEL = DEFAULT_MODEL_ID
 DEFAULT_SYSTEM_PROMPT = "Bạn là trợ lý AI hữu ích, trả lời ngắn gọn và rõ ràng."
 
 
@@ -52,13 +55,27 @@ def _live_config(
     temperature: Optional[float] = None,
     max_output_tokens: Optional[int] = None,
     top_p: Optional[float] = None,
+    thinking_budget: Optional[int] = None,
 ) -> types.LiveConnectConfig:
+    """Build the Live session config.
+
+    `thinking_budget` is left unset unless a caller asks: omitting the field
+    keeps each model's own default, which is what clients get today. Passing 0
+    turns reasoning off, which measurably cuts time-to-first-token on the
+    native-audio models (~2.3s → ~1.2s) and does roughly nothing on
+    gemini-3.1-flash-live-preview, which barely thinks to begin with.
+    """
+    extra = {}
+    if thinking_budget is not None:
+        extra["thinking_config"] = types.ThinkingConfig(thinking_budget=thinking_budget)
+
     return types.LiveConnectConfig(
         response_modalities=["AUDIO"],
         output_audio_transcription=types.AudioTranscriptionConfig(),
         system_instruction=types.Content(parts=[types.Part(text=system_prompt)]),
         tools=tools or [],
         generation_config=_make_generation_config(temperature, max_output_tokens, top_p),
+        **extra,
     )
 
 
@@ -75,6 +92,8 @@ async def _send_turn(session, parts: List[types.Part]) -> None:
 async def chat_once(
     parts: List[types.Part],
     api_key: str = DEFAULT_API_KEY,
+    model: str = MODEL,
+    thinking_budget: Optional[int] = None,
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
     temperature: Optional[float] = None,
     max_output_tokens: Optional[int] = None,
@@ -86,11 +105,12 @@ async def chat_once(
         temperature=temperature,
         max_output_tokens=max_output_tokens,
         top_p=top_p,
+        thinking_budget=thinking_budget,
     )
 
     response_parts: list[str] = []
 
-    async with client.aio.live.connect(model=MODEL, config=config) as session:
+    async with client.aio.live.connect(model=resolve_model(model), config=config) as session:
         await _send_turn(session, parts)
 
         async for response in session.receive():
@@ -110,6 +130,8 @@ async def chat_once(
 async def chat_stream(
     parts: List[types.Part],
     api_key: str = DEFAULT_API_KEY,
+    model: str = MODEL,
+    thinking_budget: Optional[int] = None,
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
     temperature: Optional[float] = None,
     max_output_tokens: Optional[int] = None,
@@ -122,9 +144,10 @@ async def chat_stream(
         temperature=temperature,
         max_output_tokens=max_output_tokens,
         top_p=top_p,
+        thinking_budget=thinking_budget,
     )
 
-    async with client.aio.live.connect(model=MODEL, config=config) as session:
+    async with client.aio.live.connect(model=resolve_model(model), config=config) as session:
         await _send_turn(session, parts)
 
         async for response in session.receive():
@@ -142,6 +165,8 @@ async def chat_stream(
 async def chat_once_ex(
     parts: List[types.Part],
     api_key: str = DEFAULT_API_KEY,
+    model: str = MODEL,
+    thinking_budget: Optional[int] = None,
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
     tools: Optional[list] = None,
     temperature: Optional[float] = None,
@@ -160,12 +185,13 @@ async def chat_once_ex(
         temperature=temperature,
         max_output_tokens=max_output_tokens,
         top_p=top_p,
+        thinking_budget=thinking_budget,
     )
 
     text_parts: list[str] = []
     function_calls: list[dict] = []
 
-    async with client.aio.live.connect(model=MODEL, config=config) as session:
+    async with client.aio.live.connect(model=resolve_model(model), config=config) as session:
         await _send_turn(session, parts)
 
         async for response in session.receive():

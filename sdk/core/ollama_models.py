@@ -1,7 +1,7 @@
 """Pydantic schemas for the Ollama protocol.
 
 Only the fields this server can honour are declared; the rest of Ollama's
-surface (keep_alive, think, raw, context) is accepted and ignored.
+surface (keep_alive, raw, context) is accepted and ignored.
 """
 
 from typing import Any, Dict, List, Literal, Optional, Union
@@ -37,6 +37,7 @@ class OllamaChatRequest(BaseModel):
     # Ollama streams by default — the opposite of the OpenAI surface.
     stream: bool = True
     keep_alive: Optional[Union[str, int]] = None
+    # false disables reasoning; "low"/"medium"/"high" map to a thinking budget.
     think: Optional[Union[bool, str]] = None
 
 

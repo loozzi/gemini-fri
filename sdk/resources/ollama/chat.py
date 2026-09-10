@@ -11,7 +11,7 @@ import json
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, List, Optional
+from typing import Any, AsyncIterator, List, Optional, Union
 
 from sdk.core.content import sniff_image_mime
 from sdk.core.exceptions import InvalidRequestError
@@ -23,9 +23,16 @@ from sdk.core.models import (
     ToolCallFunction,
 )
 from sdk.core.ollama_models import OllamaChatRequest, OllamaMessage
-from sdk.providers.gemini_live import MODEL
+from sdk.core.model_registry import DEFAULT_MODEL_ID
 
-OLLAMA_MODEL_TAG = f"{MODEL}:latest"
+
+def ollama_tag(model_id: str) -> str:
+    """Ollama addresses models as `name:tag`; ours are all `:latest`."""
+    return f"{model_id}:latest"
+
+
+# Kept for callers that just want the default model's tag.
+OLLAMA_MODEL_TAG = ollama_tag(DEFAULT_MODEL_ID)
 
 
 def now_iso() -> str:
@@ -108,6 +115,24 @@ def _to_response_format(fmt: Any) -> Optional[dict]:
     raise InvalidRequestError(400, "format must be 'json' or a JSON Schema object")
 
 
+def _to_reasoning_effort(think: Optional[Union[bool, str]]) -> Optional[str]:
+    """Map Ollama's `think` onto OpenAI's `reasoning_effort`.
+
+    `think: false` is the only value that changes anything: it asks for no
+    reasoning, which becomes "minimal". `think: true` is left unmapped because
+    these models already reason by default — turning it into a named level
+    would cap a budget the client never asked to cap. Newer Ollama clients also
+    send "low"/"medium"/"high", which pass straight through.
+    """
+    if think is None:
+        return None
+    if think is False:
+        return "minimal"
+    if think is True:
+        return None
+    return str(think).lower()
+
+
 def to_chat_request(request: OllamaChatRequest) -> ChatCompletionRequest:
     options = request.options or {}
     tuning: dict = {}
@@ -124,6 +149,7 @@ def to_chat_request(request: OllamaChatRequest) -> ChatCompletionRequest:
         messages=[_to_openai_message(m, i) for i, m in enumerate(request.messages)],
         tools=request.tools or None,
         response_format=_to_response_format(request.format),
+        reasoning_effort=_to_reasoning_effort(request.think),
         stream=request.stream,
         **tuning,
     )

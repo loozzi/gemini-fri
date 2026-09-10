@@ -12,4 +12,5 @@ dependencies = [
     "google-genai>=1.0.0",
     "python-dotenv>=1.0.0",
     "openai>=2.41.0",
+    "langchain-ollama>=1.1.0",
 ]

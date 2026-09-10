@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from routers import ollama
 from sdk.core.exceptions import APIError, AuthError, RateLimitError, ServerError
+from sdk.core.model_registry import MODELS, find as find_model
 from sdk.core.models import ChatCompletionRequest
 from sdk.resources.chat import ChatCompletions
 
@@ -109,6 +110,50 @@ async def create_chat_completion(
 
     response = await completions.create(request)
     return response
+
+
+# Models are static, so the whole list shares one `created` stamp: process
+# start. OpenAI clients only ever sort on it.
+_MODELS_CREATED = int(time.time())
+
+
+def _model_payload(model) -> dict:
+    return {
+        "id": model.id,
+        "object": "model",
+        "created": _MODELS_CREATED,
+        "owned_by": "google",
+        # Not part of OpenAI's schema, but harmless to clients and the only way
+        # a caller can tell what a model actually supports here.
+        "description": model.description,
+        "capabilities": {
+            "tools": model.supports_tools,
+            "vision": model.supports_vision,
+        },
+    }
+
+
+@app.get("/openai/v1/models")
+async def list_models():
+    return {"object": "list", "data": [_model_payload(m) for m in MODELS]}
+
+
+@app.get("/openai/v1/models/{model_id:path}")
+async def retrieve_model(model_id: str):
+    model = find_model(model_id)
+    if model is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "message": f"The model '{model_id}' does not exist",
+                    "type": "invalid_request_error",
+                    "param": "model",
+                    "code": "model_not_found",
+                }
+            },
+        )
+    return _model_payload(model)
 
 
 @app.get("/health")

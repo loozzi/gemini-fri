@@ -32,6 +32,8 @@ class ChatCompletionRequest(BaseModel):
     tools: Optional[List[dict]] = None
     tool_choice: Optional[Union[str, dict]] = None
     response_format: Optional[dict] = None
+    # "minimal" | "none" | "low" | "medium" | "high"; unset keeps the model default.
+    reasoning_effort: Optional[str] = None
     user: Optional[str] = None
 
 
