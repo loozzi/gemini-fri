@@ -16,7 +16,7 @@ from tenacity import (
 
 from google.genai import types as gtypes
 
-from sdk.core.content import build_parts, estimate_tokens, parts_text
+from sdk.core.content import build_parts, estimate_tokens
 from sdk.core.exceptions import AuthError, InvalidRequestError, RateLimitError, ServerError
 from sdk.core.models import (
     ChatCompletionRequest,
@@ -330,12 +330,30 @@ def _thinking_budget(reasoning_effort: Optional[str]) -> Optional[int]:
     return budget
 
 
+def _estimated_usage(
+    parts: List[gtypes.Part],
+    system_prompt: str,
+    output: str,
+    tools: Optional[list] = None,
+) -> Usage:
+    """Rough usage for a reply Gemini reported none for.
+
+    That is every turn paused on tool calls, so most steps of an agent loop
+    land here. The system prompt and tool declarations are counted because
+    agent clients send large ones. Everything uses the len // 4 heuristic of
+    `estimate_tokens`.
+    """
+    declared = system_prompt + "".join(tool.model_dump_json(exclude_none=True) for tool in tools or [])
+    prompt = estimate_tokens(parts) + len(declared) // 4
+    completion = len(output) // 4
+    return Usage(prompt_tokens=prompt, completion_tokens=completion, total_tokens=prompt + completion)
+
+
 def _completion(
     model: str,
     message: Message,
     finish_reason: str,
-    prompt_words: int,
-    completion_words: int = 0,
+    usage: Usage,
 ) -> ChatCompletionResponse:
     return ChatCompletionResponse(
         id=f"chatcmpl-{uuid.uuid4().hex}",
@@ -343,11 +361,7 @@ def _completion(
         created=int(time.time()),
         model=model,
         choices=[Choice(index=0, message=message, finish_reason=finish_reason)],
-        usage=Usage(
-            prompt_tokens=prompt_words,
-            completion_tokens=completion_words,
-            total_tokens=prompt_words + completion_words,
-        ),
+        usage=usage,
     )
 
 
@@ -450,14 +464,13 @@ class ChatCompletions:
         tool_results: Optional[List[tuple[str, str]]] = None,
     ) -> ChatCompletionResponse:
         await self._bucket.consume(estimate_tokens(parts))
-        prompt_words = len(parts_text(parts).split())
 
         result = None
         async for attempt in AsyncRetrying(**_RETRY_CONFIG):
             with attempt:
                 try:
                     if tools:
-                        text, function_calls = await chat_once_ex(
+                        text, function_calls, usage = await chat_once_ex(
                             parts=parts,
                             api_key=self._api_key,
                             model=model,
@@ -470,7 +483,7 @@ class ChatCompletions:
                             tool_results=tool_results,
                         )
                     else:
-                        text = await chat_once(
+                        text, usage = await chat_once(
                             parts=parts,
                             api_key=self._api_key,
                             model=model,
@@ -486,9 +499,16 @@ class ChatCompletions:
                     if translated is not exc:
                         raise translated from exc
                     raise
-                result = (text, function_calls)
+                result = (text, function_calls, usage)
 
-        text, function_calls = result
+        text, function_calls, usage = result
+        if usage is None:
+            usage = _estimated_usage(
+                parts,
+                system_prompt,
+                text + "".join(json.dumps(fc["args"], ensure_ascii=False) for fc in function_calls),
+                tools,
+            )
 
         if structured is not None:
             payload = None
@@ -511,8 +531,7 @@ class ChatCompletions:
                     model,
                     Message(role="assistant", content=content),
                     "stop",
-                    prompt_words,
-                    len(content.split()),
+                    usage,
                 )
             if not function_calls:
                 logger.warning(
@@ -539,15 +558,14 @@ class ChatCompletions:
                     ],
                 ),
                 "tool_calls",
-                prompt_words,
+                usage,
             )
 
         return _completion(
             model,
             Message(role="assistant", content=text),
             "stop",
-            prompt_words,
-            len(text.split()),
+            usage,
         )
 
     async def _replay(self, response: ChatCompletionResponse) -> AsyncIterator[dict]:
@@ -595,6 +613,9 @@ class ChatCompletions:
         yield {
             **base,
             "choices": [{"index": 0, "delta": {}, "finish_reason": choice.finish_reason}],
+            # On the finish chunk rather than a trailing one with empty
+            # `choices`, which some clients index into without checking.
+            "usage": response.usage.model_dump(exclude_none=True) if response.usage else None,
         }
 
     async def _stream(
@@ -620,10 +641,12 @@ class ChatCompletions:
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
         }
 
+        usage: Optional[Usage] = None
+        output: List[str] = []
         attempt_count = 0
         while attempt_count < 5:
             try:
-                async for text_chunk in chat_stream(
+                async for item in chat_stream(
                     parts=parts,
                     api_key=self._api_key,
                     model=model,
@@ -633,12 +656,16 @@ class ChatCompletions:
                     top_p=top_p,
                     thinking_budget=thinking_budget,
                 ):
+                    if isinstance(item, Usage):
+                        usage = item
+                        continue
+                    output.append(item)
                     yield {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": model,
-                        "choices": [{"index": 0, "delta": {"content": text_chunk}, "finish_reason": None}],
+                        "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
                     }
                 break
             except AuthError:
@@ -661,4 +688,5 @@ class ChatCompletions:
             "created": created,
             "model": model,
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": (usage or _estimated_usage(parts, system_prompt, "".join(output))).model_dump(exclude_none=True),
         }

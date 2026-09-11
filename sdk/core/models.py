@@ -56,10 +56,22 @@ class Choice(BaseModel):
     finish_reason: Optional[str] = None
 
 
+class PromptTokensDetails(BaseModel):
+    cached_tokens: int = 0
+
+
+class CompletionTokensDetails(BaseModel):
+    reasoning_tokens: int = 0
+
+
 class Usage(BaseModel):
     prompt_tokens: int
+    # Includes reasoning, as OpenAI counts it: clients derive text tokens as
+    # completion_tokens - completion_tokens_details.reasoning_tokens.
     completion_tokens: int
     total_tokens: int
+    prompt_tokens_details: Optional[PromptTokensDetails] = None
+    completion_tokens_details: Optional[CompletionTokensDetails] = None
 
 
 class ChatCompletionResponse(BaseModel):
