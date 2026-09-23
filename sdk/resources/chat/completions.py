@@ -349,6 +349,24 @@ def _estimated_usage(
     return Usage(prompt_tokens=prompt, completion_tokens=completion, total_tokens=prompt + completion)
 
 
+def _with_output_estimate(usage: Usage, output: str) -> Usage:
+    """Fill in the output side of a usage Gemini reported only half of.
+
+    For short replies — a title, a condensed query, a sentence or two — Gemini
+    Live sends `prompt_token_count` but no `response_token_count`, whether the
+    request streams or not, so the reply would count as 0 output tokens. Its
+    own counts are audio tokens and run several times higher than this
+    text-based estimate.
+    """
+    if usage.completion_tokens or not output:
+        return usage
+    completion = max(1, len(output) // 4)
+    return usage.model_copy(update={
+        "completion_tokens": completion,
+        "total_tokens": usage.prompt_tokens + completion,
+    })
+
+
 def _completion(
     model: str,
     message: Message,
@@ -502,13 +520,11 @@ class ChatCompletions:
                 result = (text, function_calls, usage)
 
         text, function_calls, usage = result
+        output = text + "".join(json.dumps(fc["args"], ensure_ascii=False) for fc in function_calls)
         if usage is None:
-            usage = _estimated_usage(
-                parts,
-                system_prompt,
-                text + "".join(json.dumps(fc["args"], ensure_ascii=False) for fc in function_calls),
-                tools,
-            )
+            usage = _estimated_usage(parts, system_prompt, output, tools)
+        else:
+            usage = _with_output_estimate(usage, output)
 
         if structured is not None:
             payload = None
@@ -682,11 +698,17 @@ class ChatCompletions:
                     wait_sec = min(2 ** attempt_count, 30)
                 await asyncio.sleep(wait_sec)
 
+        text = "".join(output)
+        usage = (
+            _with_output_estimate(usage, text)
+            if usage is not None
+            else _estimated_usage(parts, system_prompt, text)
+        )
         yield {
             "id": completion_id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": model,
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            "usage": (usage or _estimated_usage(parts, system_prompt, "".join(output))).model_dump(exclude_none=True),
+            "usage": usage.model_dump(exclude_none=True),
         }

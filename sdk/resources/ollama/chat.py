@@ -224,14 +224,16 @@ def to_ollama_response(
 async def to_ollama_stream(
     chunks: AsyncIterator[dict], model: str, started: float
 ) -> AsyncIterator[dict]:
-    eval_count = 0
+    word_count = 0
+    usage: Optional[dict] = None
 
     async for chunk in chunks:
+        usage = chunk.get("usage") or usage
         choices = chunk.get("choices") or [{}]
         delta = choices[0].get("delta") or {}
 
         if content := delta.get("content"):
-            eval_count += len(content.split())
+            word_count += len(content.split())
             yield {
                 "model": model,
                 "created_at": now_iso(),
@@ -257,4 +259,11 @@ async def to_ollama_stream(
                 "done": False,
             }
 
-    yield _final_chunk(model, started, eval_count=eval_count)
+    # The core stream puts the real usage on its finish chunk; the word count
+    # only stands in if a stream somehow ends without one.
+    if usage:
+        prompt_count = usage.get("prompt_tokens", 0)
+        eval_count = usage.get("completion_tokens", 0)
+    else:
+        prompt_count, eval_count = 0, word_count
+    yield _final_chunk(model, started, prompt_count=prompt_count, eval_count=eval_count)
