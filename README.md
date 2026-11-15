@@ -182,14 +182,15 @@ curl -X POST http://localhost:8000/openai/v1/chat/completions \
        "reasoning_effort": "minimal", "stream": true}'
 ```
 
-Omitting the field sends no thinking config at all, so each model keeps its own
-default — existing clients are unaffected. An unrecognised value is a 400.
+For the existing models, omitting the field sends no thinking config, preserving
+the model default. An unrecognised value is a 400.
 
 For `gemini-3.8-live`, the bridge omits `thinking_config` even when an effort
 is requested, as this model does not accept configurable reasoning levels.
 For `gemini-3.8-live-extended-thinking`, `low`/`medium`/`high` map to
 `thinking_level`; `minimal`/`none` (including Ollama `think: false`) map to `low`
-because reasoning cannot be disabled. Omitted effort keeps the model default.
+because reasoning cannot be disabled. Omitted effort uses `low` for Extended
+Thinking because its endpoint requires an explicit level.
 See [Google's Live thinking guide](https://ai.google.dev/gemini-api/docs/live-api/thinking).
 
 Ollama clients use `think` instead, and it reaches the same setting:

@@ -38,7 +38,7 @@ class ConfigTests(unittest.TestCase):
         config = _live_config('test', model=LIVE, tools=[original], thinking_budget=8192)
         self.assertIsNone(config.thinking_config)
         self.assertEqual(config.tools[0].function_declarations[0].behavior, 'BLOCKING')
-        self.assertIsNone(_live_config('test', model=THINKING).thinking_config)
+        self.assertEqual(_live_config('test', model=THINKING).thinking_config.thinking_level, 'LOW')
         self.assertEqual(_live_config('test', thinking_budget=512).thinking_config.thinking_budget, 512)
         for model in (LIVE, THINKING):
             self.assertEqual(resolve(model + ':latest'), model)

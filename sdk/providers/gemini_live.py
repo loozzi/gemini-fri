@@ -69,7 +69,7 @@ def _live_config(
     """Build the Live session config.
 
     `thinking_budget` is left unset unless a caller asks: omitting the field
-    keeps each model's own default, which is what clients get today. Passing 0
+    keeps legacy models' own defaults. Passing 0
     turns reasoning off on legacy models, which cuts time-to-first-token on the
     native-audio models (~2.3s → ~1.2s) and does roughly nothing on
     gemini-3.1-flash-live-preview, which barely thinks to begin with. Gemini 3.8
@@ -79,6 +79,8 @@ def _live_config(
     model_id = resolve_model(model)
     extra = {}
     if model_id == _EXTENDED_THINKING:
+        # The live endpoint requires a level even when effort was omitted.
+        level = "low"
         if thinking_budget is not None:
             # This model cannot disable reasoning; map minimal/none to low.
             level = (
@@ -86,7 +88,7 @@ def _live_config(
                 else "medium" if thinking_budget <= 2048
                 else "high"
             )
-            extra["thinking_config"] = types.ThinkingConfig(thinking_level=level)
+        extra["thinking_config"] = types.ThinkingConfig(thinking_level=level)
     elif model_id != "gemini-3.8-live" and thinking_budget is not None:
         extra["thinking_config"] = types.ThinkingConfig(thinking_budget=thinking_budget)
 
@@ -94,10 +96,10 @@ def _live_config(
     for tool in session_tools:
         for declaration in tool.function_declarations or []:
             if model_id == _EXTENDED_THINKING:
-                declaration.behavior = "NON_BLOCKING"
+                declaration.behavior = types.Behavior.NON_BLOCKING
             elif model_id == "gemini-3.8-live":
                 # Preserve the bridge's request/response tool lifecycle.
-                declaration.behavior = "BLOCKING"
+                declaration.behavior = types.Behavior.BLOCKING
 
     return types.LiveConnectConfig(
         response_modalities=["AUDIO"],
