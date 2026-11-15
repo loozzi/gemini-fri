@@ -8,6 +8,7 @@ gives no ordering guarantee, and images carry enough preprocessing cost that a
 following text message can reach the model first.
 """
 
+import json
 import logging
 import os
 import re
@@ -30,6 +31,7 @@ DEFAULT_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_API_KEY")
 # Kept as the module-level default; the servable set lives in sdk.core.model_registry.
 MODEL = DEFAULT_MODEL_ID
 DEFAULT_SYSTEM_PROMPT = "Bạn là trợ lý AI hữu ích, trả lời ngắn gọn và rõ ràng."
+_EXTENDED_THINKING = "gemini-3.8-live-extended-thinking"
 
 
 # ─── Setup ────────────────────────────────────────────────────────────────────
@@ -62,27 +64,100 @@ def _live_config(
     max_output_tokens: Optional[int] = None,
     top_p: Optional[float] = None,
     thinking_budget: Optional[int] = None,
+    model: str = MODEL,
 ) -> types.LiveConnectConfig:
     """Build the Live session config.
 
     `thinking_budget` is left unset unless a caller asks: omitting the field
     keeps each model's own default, which is what clients get today. Passing 0
-    turns reasoning off, which measurably cuts time-to-first-token on the
+    turns reasoning off on legacy models, which cuts time-to-first-token on the
     native-audio models (~2.3s → ~1.2s) and does roughly nothing on
-    gemini-3.1-flash-live-preview, which barely thinks to begin with.
+    gemini-3.1-flash-live-preview, which barely thinks to begin with. Gemini 3.8
+    Live omits thinking config; Extended Thinking uses levels and cannot turn
+    reasoning off.
     """
+    model_id = resolve_model(model)
     extra = {}
-    if thinking_budget is not None:
+    if model_id == _EXTENDED_THINKING:
+        if thinking_budget is not None:
+            # This model cannot disable reasoning; map minimal/none to low.
+            level = (
+                "low" if thinking_budget <= 512
+                else "medium" if thinking_budget <= 2048
+                else "high"
+            )
+            extra["thinking_config"] = types.ThinkingConfig(thinking_level=level)
+    elif model_id != "gemini-3.8-live" and thinking_budget is not None:
         extra["thinking_config"] = types.ThinkingConfig(thinking_budget=thinking_budget)
+
+    session_tools = [types.Tool.model_validate(tool).model_copy(deep=True) for tool in (tools or [])]
+    for tool in session_tools:
+        for declaration in tool.function_declarations or []:
+            if model_id == _EXTENDED_THINKING:
+                declaration.behavior = "NON_BLOCKING"
+            elif model_id == "gemini-3.8-live":
+                # Preserve the bridge's request/response tool lifecycle.
+                declaration.behavior = "BLOCKING"
 
     return types.LiveConnectConfig(
         response_modalities=["AUDIO"],
         output_audio_transcription=types.AudioTranscriptionConfig(),
         system_instruction=types.Content(parts=[types.Part(text=system_prompt)]),
-        tools=tools or [],
+        tools=session_tools,
         generation_config=_make_generation_config(temperature, max_output_tokens, top_p),
         **extra,
     )
+
+
+class _InteractionSocket:
+    """Keep interactionStatus before google-genai 2.8 drops unknown fields.
+
+    The SDK also ends receive() at every turnComplete, including spoken fillers.
+    Keep this adapter local to Extended Thinking sessions until the SDK exposes
+    the interaction lifecycle itself.
+    """
+
+    def __init__(self, socket):
+        self.socket = socket
+        self.status = None
+
+    def __getattr__(self, name):
+        return getattr(self.socket, name)
+
+    async def recv(self, *args, **kwargs):
+        raw = await self.socket.recv(*args, **kwargs)
+        payload = json.loads(raw) if raw else {}
+        content = payload.get("serverContent") or {}
+        self.status = content.get("interactionStatus", payload.get("interactionStatus", self.status))
+        if set(payload) == {"interactionStatus"}:
+            # The SDK treats unknown-only messages as API errors.
+            return json.dumps({"serverContent": {"turnComplete": self.status == "IDLE"}})
+        return raw
+
+
+def _track_interaction(session, model: str) -> None:
+    if resolve_model(model) == _EXTENDED_THINKING and not isinstance(session._ws, _InteractionSocket):
+        session._ws = _InteractionSocket(session._ws)
+
+
+async def _responses(session):
+    """Read through intermediate utterances until idle or a tool call."""
+    socket = getattr(session, "_ws", None)
+    while True:
+        received = False
+        async for response in session.receive():
+            received = True
+            yield response
+            if response.tool_call:
+                return
+            content = response.server_content
+            if isinstance(socket, _InteractionSocket):
+                if socket.status == "IDLE":
+                    return
+            elif content and content.turn_complete:
+                return
+        if not received or not isinstance(socket, _InteractionSocket):
+            return
 
 
 async def _send_turn(session, parts: List[types.Part]) -> None:
@@ -154,15 +229,17 @@ async def chat_once(
         max_output_tokens=max_output_tokens,
         top_p=top_p,
         thinking_budget=thinking_budget,
+        model=model,
     )
 
     response_parts: list[str] = []
     usage: Optional[Usage] = None
 
     async with client.aio.live.connect(model=resolve_model(model), config=config) as session:
+        _track_interaction(session, model)
         await _send_turn(session, parts)
 
-        async for response in session.receive():
+        async for response in _responses(session):
             usage = _usage(response.usage_metadata) or usage
             server_content = response.server_content
             if server_content is None:
@@ -170,9 +247,6 @@ async def chat_once(
 
             if server_content.output_transcription:
                 response_parts.append(server_content.output_transcription.text)
-
-            if server_content.turn_complete:
-                break
 
     return "".join(response_parts), usage
 
@@ -199,12 +273,14 @@ async def chat_stream(
         max_output_tokens=max_output_tokens,
         top_p=top_p,
         thinking_budget=thinking_budget,
+        model=model,
     )
 
     async with client.aio.live.connect(model=resolve_model(model), config=config) as session:
+        _track_interaction(session, model)
         await _send_turn(session, parts)
 
-        async for response in session.receive():
+        async for response in _responses(session):
             usage = _usage(response.usage_metadata) or usage
             server_content = response.server_content
             if server_content is None:
@@ -212,9 +288,6 @@ async def chat_stream(
 
             if server_content.output_transcription:
                 yield server_content.output_transcription.text
-
-            if server_content.turn_complete:
-                break
 
         if usage is not None:
             yield usage
@@ -224,6 +297,7 @@ async def _open(api_key: str, model_id: str, config: types.LiveConnectConfig):
     """Enter a Live connection by hand, so it can outlive the request that opened it."""
     connection = _client(api_key).aio.live.connect(model=model_id, config=config)
     session = await connection.__aenter__()
+    _track_interaction(session, model_id)
     return connection, session
 
 
@@ -233,15 +307,13 @@ async def _read_turn(session) -> tuple[str, list, Optional[Usage]]:
     calls: list = []
     usage: Optional[Usage] = None
 
-    async for response in session.receive():
+    async for response in _responses(session):
         usage = _usage(response.usage_metadata) or usage
         server_content = response.server_content
         if server_content:
             transcription = server_content.output_transcription
             if transcription and transcription.text:
                 text_parts.append(transcription.text)
-            if server_content.turn_complete:
-                break
 
         if response.tool_call:
             calls.extend(response.tool_call.function_calls)
@@ -367,6 +439,7 @@ async def chat_once_ex(
         max_output_tokens=max_output_tokens,
         top_p=top_p,
         thinking_budget=thinking_budget,
+        model=model,
     )
     connection, session = await _open(api_key, model_id, config)
     try:

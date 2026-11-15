@@ -124,20 +124,26 @@ curl http://localhost:8000/openai/v1/models
 
 | id | notes |
 | --- | --- |
+| `gemini-3.8-live` | Gemini 3.8 Live, low-latency real-time dialogue |
+| `gemini-3.8-live-extended-thinking` | Gemini 3.8 Live Extended Thinking, background reasoning |
 | `gemini-3.1-flash-live-preview` | default; used when `model` is omitted or unrecognised |
 | `gemini-2.5-flash-native-audio-preview-12-2025` | Gemini 2.5 Flash native audio, 12-2025 preview |
 | `gemini-2.5-flash-native-audio-latest` | Gemini 2.5 Flash native audio, latest |
 | `gemini-2.5-flash-native-audio-preview-09-2025` | Gemini 2.5 Flash native audio, 09-2025 preview |
 
-All four support tools and image input. Ids are exactly the strings Gemini's
+All six support tools and image input. Ids are exactly the strings Gemini's
 Live API expects, so `model` here is the same name you would use against Google
 directly.
 
-Seven Gemini models advertise `bidiGenerateContent`, but only these four hold a
-text conversation over an audio-transcription session — `gemini-3.5-transcribe-live`
-and `gemini-robotics-er-2-streaming-preview` reject the AUDIO modality with a
-`1007` close, and `gemini-3.5-live-translate-preview` never answers. Listing
-them would only hand out ids that fail at request time.
+The two Gemini 3.8 ids are documented in [Google's model catalogue](https://ai.google.dev/gemini-api/docs/models).
+Extended Thinking uses non-blocking function calls and waits for
+`interactionStatus: IDLE` across intermediate utterances. The bridge preserves
+that status before the current google-genai SDK discards unknown fields.
+Standard Gemini 3.8 Live uses blocking tools to preserve the bridge's tool
+request/response flow. The existing default remains Gemini 3.1 Flash Live.
+
+Transcription-only, robotics, and translation-specific Live models are excluded
+because they do not support this server's audio-transcription chat flow.
 
 An unknown `model` is **not** an error on `/chat/completions`: the request runs
 on the default model, which keeps existing client configs working. Ask for one
@@ -156,7 +162,7 @@ stripped before the model is resolved.
 
 ## Reasoning effort
 
-Gemini Live takes a *thinking budget* in tokens. `reasoning_effort` maps onto it:
+For the existing models, `reasoning_effort` maps to a *thinking budget* in tokens:
 
 | `reasoning_effort` | thinking budget | time to first token* |
 | --- | --- | --- |
@@ -178,6 +184,13 @@ curl -X POST http://localhost:8000/openai/v1/chat/completions \
 
 Omitting the field sends no thinking config at all, so each model keeps its own
 default — existing clients are unaffected. An unrecognised value is a 400.
+
+For `gemini-3.8-live`, the bridge omits `thinking_config` even when an effort
+is requested, as this model does not accept configurable reasoning levels.
+For `gemini-3.8-live-extended-thinking`, `low`/`medium`/`high` map to
+`thinking_level`; `minimal`/`none` (including Ollama `think: false`) map to `low`
+because reasoning cannot be disabled. Omitted effort keeps the model default.
+See [Google's Live thinking guide](https://ai.google.dev/gemini-api/docs/live-api/thinking).
 
 Ollama clients use `think` instead, and it reaches the same setting:
 `think: false` → `minimal`, `think: "low"|"medium"|"high"` → that level.
@@ -448,7 +461,7 @@ Once running, visit `http://localhost:8000/docs` for interactive API docs powere
 
 | Field | Type | Description |
 |---|---|---|
-| `model` | string | Any string (passed through; actual model is `gemini-3.1-flash-live-preview`) |
+| `model` | string | A model id from the Models table; unknown ids use the default |
 | `messages` | array | OpenAI message format (`system`, `user`, `assistant`, `tool`); `content` may be a string or a list of `text` / `image_url` parts |
 | `stream` | bool | Enable SSE streaming (default: `false`) |
 | `tools` | array | OpenAI function definitions (converted to Gemini `FunctionDeclaration`) |

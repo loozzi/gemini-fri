@@ -5,8 +5,8 @@ client configures the same name it would use against Gemini directly — there i
 no alias layer to keep in sync.
 
 The list is deliberately curated rather than read from `client.models.list()`.
-Seven models advertise `bidiGenerateContent`, but only these four actually hold
-a text conversation over an audio-transcription session; the other three
+Only models supporting a text conversation over an audio-transcription session
+are listed. Other Live models
 (`gemini-3.5-transcribe-live`, `gemini-robotics-er-2-streaming-preview`,
 `gemini-3.5-live-translate-preview`) either reject the AUDIO modality with
 `1007` or never answer. Listing them would only hand clients ids that fail at
@@ -30,6 +30,14 @@ class ModelInfo:
 DEFAULT_MODEL_ID = "gemini-3.1-flash-live-preview"
 
 MODELS: tuple[ModelInfo, ...] = (
+    ModelInfo(
+        id="gemini-3.8-live",
+        description="Gemini 3.8 Live — hội thoại thời gian thực, độ trễ thấp.",
+    ),
+    ModelInfo(
+        id="gemini-3.8-live-extended-thinking",
+        description="Gemini 3.8 Live Extended Thinking — suy luận nền nâng cao.",
+    ),
     ModelInfo(
         id="gemini-3.1-flash-live-preview",
         description="Gemini 3.1 Flash Live — mặc định, độ trễ thấp.",
